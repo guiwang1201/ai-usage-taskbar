@@ -1,0 +1,11 @@
+# Intentionally without settings.
+#
+# This folder is synced between machines, so nothing machine-specific belongs here.
+# Put the build output outside the synced folder in your own cargo config instead
+# (%USERPROFILE%\.cargo\config.toml on Windows, ~/.cargo/config.toml on macOS):
+#
+#   [build]
+#   target-dir = "<a folder that is not synced>"
+#
+# Without that, cargo writes a large `target` folder next to the sources and the sync
+# client uploads all of it.

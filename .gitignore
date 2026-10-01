@@ -1,0 +1,7 @@
+# Build output
+/target/
+/dist/
+
+# Feasibility-phase scripts, prototype and notes. They describe one machine and one
+# account, and are kept locally only.
+/phase0/

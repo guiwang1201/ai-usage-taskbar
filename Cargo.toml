@@ -1,0 +1,40 @@
+[package]
+name = "iusage"
+version = "0.1.0"
+edition = "2021"
+description = "Taskbar usage meter for Claude and Codex"
+license = "MIT"
+repository = "https://github.com/guiwang1201/ai-usage-taskbar"
+build = "build.rs"
+
+[dependencies]
+tinyjson = "2"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[target.'cfg(windows)'.build-dependencies]
+embed-manifest = "1.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,3 @@
+# The same working tree is used from Windows and macOS: keep one line ending everywhere.
+* text=auto eol=lf
+*.png binary
