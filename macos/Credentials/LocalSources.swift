@@ -5,8 +5,11 @@ struct LocalSources {
     let environment: [String: String]
     let reader: CredentialReader
     func claude(now: Date = Date()) throws -> OAuthCredential {
-        try reader.claude(home: home, account: NSUserName(), configDirectory: environment["CLAUDE_CONFIG_DIR"],
-                          secureStorageDirectory: environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"], now: now)
+        try CredentialReader.parseClaude(claudeRecord().data, now: now)
+    }
+    func claudeRecord() throws -> ClaudeCredentialRecord {
+        try reader.claudeRecord(home: home, account: NSUserName(), configDirectory: environment["CLAUDE_CONFIG_DIR"],
+                                secureStorageDirectory: environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"])
     }
     var codexDirectory: URL {
         environment["CODEX_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }

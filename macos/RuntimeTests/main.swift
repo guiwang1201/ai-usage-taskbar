@@ -78,3 +78,23 @@ precondition(AlertPolicy.evaluate(reading: high, marks: &marks, now: 1001).isEmp
 let newWindow = SavedReading(five: 95, seven: 10, fetchedAt: 1000, fiveReset: 4000, sevenReset: 5000)
 precondition(AlertPolicy.evaluate(reading: newWindow, marks: &marks, now: 1000).count == 1)
 print("PASS: alerts deduplicate and rearm on a new window")
+
+let issues = OfflineRuntime(state: OfflineState(), save: { _ in })
+precondition(issues.issue(0) == nil && issues.issue(2) == nil)
+issues.setLocalIssue(0, "已过期")
+precondition(issues.issue(0) == "已过期" && issues.issue(1) == nil)
+precondition(try! issues.simulate(provider: 0, now: 1000, status: 429, body: ""))
+precondition(issues.errors[0] == "限流" && issues.localIssues[0] == nil && issues.issue(0) == "限流")
+issues.setLocalIssue(0, "未登录")
+precondition(issues.issue(0) == "未登录") // the newer local finding wins over a fetch error
+issues.setLocalIssue(5, "ignored")
+precondition(issues.issue(5) == nil)
+var alertState = OfflineState()
+alertState.notifications = true
+alertState.readings[0] = SavedReading(five: 95, seven: 10, fetchedAt: 1000, fiveReset: 5000, sevenReset: 6000)
+let quiet = OfflineRuntime(state: alertState, save: { _ in })
+quiet.setLocalIssue(0, "已过期")
+precondition(try! quiet.consumeAlert(provider: 0, now: 1000).isEmpty)
+quiet.setLocalIssue(0, nil)
+precondition(try! !quiet.consumeAlert(provider: 0, now: 1000).isEmpty)
+print("PASS: local credential issues outrank fetch errors, clear on a completed request, and silence alerts")

@@ -13,6 +13,16 @@ struct OAuthCredential {
     let accountID: String?
 }
 
+enum ClaudeSource: Equatable {
+    case keychain(service: String, account: String)
+    case file(URL)
+}
+
+struct ClaudeCredentialRecord {
+    let data: Data
+    let source: ClaudeSource
+}
+
 struct CredentialReader {
     typealias KeychainRead = (String, String) throws -> Data
     let readKeychain: KeychainRead
@@ -70,15 +80,31 @@ struct CredentialReader {
 
     func claude(home: URL, account: String, configDirectory: String? = nil,
                 secureStorageDirectory: String? = nil, now: Date = Date()) throws -> OAuthCredential {
+        let record = try claudeRecord(home: home, account: account, configDirectory: configDirectory,
+                                      secureStorageDirectory: secureStorageDirectory)
+        return try Self.parseClaude(record.data, now: now)
+    }
+
+    // The stored text and where it was found, so a renewed token can go back to the
+    // same place and nowhere else.
+    func claudeRecord(home: URL, account: String, configDirectory: String? = nil,
+                      secureStorageDirectory: String? = nil) throws -> ClaudeCredentialRecord {
         let service = Self.claudeService(configDirectory: configDirectory, secureStorageDirectory: secureStorageDirectory)
-        let data: Data
-        do { data = try readKeychain(service, account) }
-        catch CredentialFailure.missing {
+        do {
+            return ClaudeCredentialRecord(data: try readKeychain(service, account), source: .keychain(service: service, account: account))
+        } catch CredentialFailure.missing {
             let folder = configDirectory.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
                 ?? home.appendingPathComponent(".claude")
-            data = try readFile(folder.appendingPathComponent(".credentials.json"))
+            let url = folder.appendingPathComponent(".credentials.json")
+            return ClaudeCredentialRecord(data: try readFile(url), source: .file(url))
         }
-        return try Self.parseClaude(data, now: now)
+    }
+
+    func read(_ source: ClaudeSource) throws -> Data {
+        switch source {
+        case .keychain(let service, let account): return try readKeychain(service, account)
+        case .file(let url): return try readFile(url)
+        }
     }
 
     // File mode only for now. Callers must not use it as a fallback for keyring,

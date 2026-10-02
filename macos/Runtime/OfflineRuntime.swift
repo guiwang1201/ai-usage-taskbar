@@ -58,9 +58,20 @@ final class OfflineStore {
 final class OfflineRuntime {
     private(set) var state: OfflineState
     private(set) var errors: [String?] = [nil, nil]
+    // Credential problems found before any request. They are newer than a fetch
+    // error and are cleared once a request completes, which proves the login works.
+    private(set) var localIssues: [String?] = [nil, nil]
     private let save: (OfflineState) throws -> Void
     init(state: OfflineState, save: @escaping (OfflineState) throws -> Void) {
         self.state = state; self.save = save
+    }
+    func issue(_ provider: Int) -> String? {
+        guard (0...1).contains(provider) else { return nil }
+        return localIssues[provider] ?? errors[provider]
+    }
+    func setLocalIssue(_ provider: Int, _ text: String?) {
+        guard (0...1).contains(provider) else { return }
+        localIssues[provider] = text
     }
     func select(_ provider: Int) throws {
         guard (0...1).contains(provider) else { return }
@@ -79,7 +90,7 @@ final class OfflineRuntime {
     }
     func consumeAlert(provider: Int, now: Int64) throws -> [String] {
         guard state.notifications == true, provider == state.selectedProvider,
-              errors[provider] == nil, let reading = state.readings[provider] else { return [] }
+              issue(provider) == nil, let reading = state.readings[provider] else { return [] }
         var updated = state
         var marks = updated.alertMarks ?? [[AlertMark(), AlertMark()], [AlertMark(), AlertMark()]]
         guard marks.count == 2, marks.allSatisfy({ $0.count == 2 }) else { throw CocoaError(.fileReadCorruptFile) }
@@ -104,6 +115,11 @@ final class OfflineRuntime {
         return true
     }
     private var inFlight: Set<Int> = []
+    func canRequest(provider: Int, now: Int64) -> Bool {
+        guard (0...1).contains(provider), !inFlight.contains(provider) else { return false }
+        var gate = state.gates[provider].native
+        return iusage_can_request(&gate, now)
+    }
     func reserve(provider: Int, now: Int64) throws -> Bool {
         guard (0...1).contains(provider), !inFlight.contains(provider) else { return false }
         var gate = state.gates[provider].native
@@ -114,8 +130,21 @@ final class OfflineRuntime {
         inFlight.insert(provider)
         return true
     }
+    // Ends a reservation made for a token renewal, which is a request to the same
+    // service and uses the same gate. Success schedules the usage request one minimum
+    // gap later; any other answer gets the usual wait. `label` is what the user sees.
+    func completeRefresh(provider: Int, now: Int64, status: UInt16, retryAfter: UInt32 = 0, label: String?) throws {
+        guard inFlight.remove(provider) != nil else { return }
+        localIssues[provider] = nil
+        var gate = state.gates[provider].native
+        _ = iusage_complete(&gate, now, status, retryAfter, 120)
+        state.gates[provider] = SavedGate(gate)
+        errors[provider] = status == 200 ? nil : label
+        try save(state)
+    }
     func complete(provider: Int, now: Int64, status: UInt16, retryAfter: UInt32 = 0, body: String) throws {
         guard inFlight.remove(provider) != nil else { return }
+        localIssues[provider] = nil
         var gate = state.gates[provider].native
         var usage = MacUsage()
         let data = Data(body.utf8)

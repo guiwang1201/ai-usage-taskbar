@@ -5,7 +5,7 @@ BUILD_ROOT=${IUSAGE_MAC_BUILD_DIR:-/private/tmp/iusage-mac-build}
 export CARGO_HOME="${CARGO_HOME:-$BUILD_ROOT/cargo-home}"
 mkdir -p "$BUILD_ROOT/module-cache"
 swiftc -warnings-as-errors -module-cache-path "$BUILD_ROOT/module-cache" \
-  "$MAC_ROOT/Credentials/Credentials.swift" "$MAC_ROOT/Credentials/CodexStorage.swift" "$MAC_ROOT/Credentials/LocalSources.swift" "$MAC_ROOT/Tests/main.swift" -o "$BUILD_ROOT/credential-tests"
+  "$MAC_ROOT/Credentials/Credentials.swift" "$MAC_ROOT/Credentials/CodexStorage.swift" "$MAC_ROOT/Credentials/LocalSources.swift" "$MAC_ROOT/Credentials/LocalIssue.swift" "$MAC_ROOT/Tests/main.swift" -o "$BUILD_ROOT/credential-tests"
 "$BUILD_ROOT/credential-tests"
 cargo test --offline --manifest-path "$MAC_ROOT/Core/Cargo.toml" --target-dir "$BUILD_ROOT/rust"
 cargo build --release --offline --manifest-path "$MAC_ROOT/Core/Cargo.toml" --target-dir "$BUILD_ROOT/rust"
@@ -27,13 +27,19 @@ swiftc -warnings-as-errors -module-cache-path "$BUILD_ROOT/module-cache" \
   "$MAC_ROOT/Network/UsageHTTP.swift" "$MAC_ROOT/Network/FetchCoordinator.swift" \
   "$MAC_ROOT/CoordinatorTests/main.swift" "$CORE_LIB" -o "$BUILD_ROOT/coordinator-tests"
 "$BUILD_ROOT/coordinator-tests"
+swiftc -warnings-as-errors -module-cache-path "$BUILD_ROOT/module-cache" \
+  -import-objc-header "$CORE_HEADER" "$MAC_ROOT/Runtime/AlertPolicy.swift" "$MAC_ROOT/Runtime/DurableFile.swift" "$MAC_ROOT/Runtime/OfflineRuntime.swift" \
+  "$MAC_ROOT/Credentials/Credentials.swift" "$MAC_ROOT/Credentials/LocalIssue.swift" "$MAC_ROOT/Network/UsageHTTP.swift" \
+  "$MAC_ROOT/Runtime/ClaudeStore.swift" "$MAC_ROOT/Runtime/ClaudeRenewal.swift" "$MAC_ROOT/RenewalTests/main.swift" "$CORE_LIB" -o "$BUILD_ROOT/renewal-tests"
+"$BUILD_ROOT/renewal-tests"
 APP_DIR="$BUILD_ROOT/IUsage Prototype.app"
 mkdir -p "$APP_DIR/Contents/MacOS"
 swiftc -Osize -Xlinker -dead_strip -warnings-as-errors -module-cache-path "$BUILD_ROOT/module-cache" \
    -import-objc-header "$CORE_HEADER" "$MAC_ROOT/Prototype/CoreUsage.swift" \
   "$MAC_ROOT/Prototype/DisplayFormat.swift" "$MAC_ROOT/Prototype/UsageBars.swift" "$MAC_ROOT/Runtime/AlertPolicy.swift" "$MAC_ROOT/Runtime/DurableFile.swift" "$MAC_ROOT/Runtime/OfflineRuntime.swift" \
-  "$MAC_ROOT/Credentials/Credentials.swift" "$MAC_ROOT/Credentials/CodexStorage.swift" "$MAC_ROOT/Credentials/LocalSources.swift" \
+  "$MAC_ROOT/Credentials/Credentials.swift" "$MAC_ROOT/Credentials/CodexStorage.swift" "$MAC_ROOT/Credentials/LocalSources.swift" "$MAC_ROOT/Credentials/LocalIssue.swift" \
   "$MAC_ROOT/Network/UsageHTTP.swift" "$MAC_ROOT/Network/FetchCoordinator.swift" \
+  "$MAC_ROOT/Runtime/ClaudeStore.swift" "$MAC_ROOT/Runtime/ClaudeRenewal.swift" \
   "$MAC_ROOT/Prototype/SystemFeatures.swift" "$MAC_ROOT/Prototype/main.swift" "$CORE_LIB" -o "$APP_DIR/Contents/MacOS/IUsagePrototype"
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

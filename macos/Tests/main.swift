@@ -57,3 +57,16 @@ print("PASS: direct Codex Keychain, auto fallback, keyring isolation")
 
 fails(.unsupportedLogin) { _ = try noFallback.codex(directory: home, mode: .auto, backend: .secrets) }
 print("PASS: encrypted secrets backend is explicitly rejected")
+
+let claudeLabels = [CredentialFailure.missing, .expired, .accessRequired, .malformed, .unsupportedLogin, .unavailable(-25308)].map { LocalIssue($0, provider: 0) }
+check(Set(claudeLabels.map(\.label)).count == claudeLabels.count)
+check(claudeLabels.allSatisfy { !$0.label.isEmpty && $0.recheckSeconds >= 15 })
+check(LocalIssue(CredentialFailure.missing, provider: 0).label.hasPrefix("未登录"))
+check(LocalIssue(CredentialFailure.expired, provider: 0).label.contains("Claude Code"))
+check(LocalIssue(CredentialFailure.expired, provider: 1).label.contains("Codex"))
+// A missing or expired login is the case a person fixes within seconds; others are not.
+check(LocalIssue(CredentialFailure.missing, provider: 1).recheckSeconds == 15)
+check(LocalIssue(CredentialFailure.expired, provider: 1).recheckSeconds == 15)
+check(LocalIssue(CredentialFailure.malformed, provider: 0).recheckSeconds == 60)
+check(LocalIssue(CocoaError(.fileReadUnknown), provider: 0).label == "凭据不可用")
+print("PASS: local credential problems map to distinct labels and recheck intervals")

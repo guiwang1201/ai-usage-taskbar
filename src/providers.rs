@@ -234,7 +234,7 @@ fn digest(token: &str) -> u64 {
 
 /// The request Claude Code itself sends to renew a token: the stored refresh token, the
 /// client and the scopes it was issued with.
-fn refresh_request(env: &Env, oauth: &JsonValue, refresh_token: &str) -> Request {
+fn refresh_request(user_agent: String, oauth: &JsonValue, refresh_token: &str) -> Request {
     let client_id = get(oauth, "clientId").and_then(text).filter(|id| token_ok(id)).unwrap_or(CLAUDE_CLIENT_ID);
     let scope = match get(oauth, "scopes") {
         Some(JsonValue::Array(items)) => items.iter().filter_map(text).collect::<Vec<_>>().join(" "),
@@ -252,10 +252,99 @@ fn refresh_request(env: &Env, oauth: &JsonValue, refresh_token: &str) -> Request
     Request {
         host: CLAUDE_TOKEN_HOST,
         path: CLAUDE_TOKEN_PATH,
-        user_agent: claude_user_agent(&env.claude_code_dirs),
+        user_agent,
         headers: vec![("Content-Type", "application/json".to_string()), ("Accept", "application/json".to_string())],
         body: Some(body),
     }
+}
+
+/// A renewal that passed every check that can be made without the network.
+pub struct RefreshPlan {
+    pub request: Request,
+    /// The refresh token the request spends; what the store must still hold afterwards.
+    refresh: String,
+}
+
+/// Decides, from the stored credentials `stored`, whether Claude's access token needs
+/// renewing and whether it is safe to try. `Ok(None)`: it is not expired, someone else
+/// renewed it since the caller looked. Everything that can fail locally is checked here,
+/// before the server is asked to retire the old refresh token: `can_store` says whether
+/// the store takes a write, and the layout of `stored` must be patchable.
+pub fn plan_claude_refresh(
+    stored: &str,
+    now: i64,
+    user_agent: String,
+    can_store: &mut dyn FnMut() -> bool,
+) -> Result<Option<RefreshPlan>, FetchError> {
+    let root = json::parse(stored).ok_or(FetchError::NoCredentials)?;
+    let oauth = get(&root, "claudeAiOauth").ok_or(FetchError::NoCredentials)?;
+    let past = |key: &str| get(oauth, key).and_then(num).is_some_and(|ms| (ms / 1000.0) as i64 <= now);
+    if !past("expiresAt") {
+        return Ok(None);
+    }
+    let refresh = get(oauth, "refreshToken").and_then(text).filter(|t| token_ok(t)).ok_or(FetchError::Expired)?;
+    if past("refreshTokenExpiresAt") {
+        return Err(FetchError::Expired);
+    }
+    if REJECTED_REFRESH.load(Ordering::Relaxed) == digest(refresh) {
+        // Nothing is sent, so this is a local verdict: the store is looked at again soon
+        // and a new sign-in is picked up as soon as it is stored.
+        return Err(FetchError::Expired);
+    }
+    // Prove the store can be written, and that the layout can be patched, before the
+    // server is asked to retire the old refresh token. The stand-ins differ from what
+    // is stored, so a member that cannot take effect (a repeated key, say) shows up.
+    let access = get(oauth, "accessToken").and_then(text).unwrap_or_default();
+    let stand_in = [
+        ("accessToken", json_string(&format!("{access}~"))),
+        ("refreshToken", json_string(&format!("{refresh}~"))),
+        ("expiresAt", "-1".to_string()),
+    ];
+    if !can_store() || patch_oauth(stored, &root, &stand_in).is_none() {
+        return Err(FetchError::CannotSave);
+    }
+    Ok(Some(RefreshPlan { request: refresh_request(user_agent, oauth, refresh), refresh: refresh.to_string() }))
+}
+
+/// The server's answer to `plan`'s request. `Ok(Some(text))` is the credentials to store
+/// in place of what is there; `Ok(None)` means leave the store alone, because another
+/// process renewed in the meantime and its tokens are the ones to keep. `current` reads
+/// the store again and is only called once the answer is a usable renewal.
+pub fn finish_claude_refresh(
+    plan: &RefreshPlan,
+    response: &Response,
+    now: i64,
+    current: &mut dyn FnMut() -> Result<String, FetchError>,
+) -> Result<Option<String>, FetchError> {
+    match response.status {
+        200 => {}
+        400 | 401 | 403 => {
+            REJECTED_REFRESH.store(digest(&plan.refresh), Ordering::Relaxed);
+            return Err(FetchError::Unauthorized);
+        }
+        429 => return Err(FetchError::RateLimited(response.retry_after)),
+        other => return Err(FetchError::Http(other)),
+    }
+    let renewal = parse_renewal(&response.body)?;
+
+    // If the refresh token stored now is no longer the one used, another process renewed
+    // in the meantime and its tokens are the ones to keep.
+    let file = current()?;
+    let root = json::parse(&file).ok_or(FetchError::NoCredentials)?;
+    let oauth = get(&root, "claudeAiOauth").ok_or(FetchError::NoCredentials)?;
+    if get(oauth, "refreshToken").and_then(text) != Some(plan.refresh.as_str()) {
+        return Ok(None);
+    }
+    let from_now_ms = |secs: i64| (now.saturating_add(secs)).saturating_mul(1000).to_string();
+    let mut updates = vec![
+        ("accessToken", json_string(&renewal.access_token)),
+        ("refreshToken", json_string(renewal.refresh_token.as_deref().unwrap_or(&plan.refresh))),
+        ("expiresAt", from_now_ms(renewal.expires_in_secs)),
+    ];
+    if let (Some(secs), Some(_)) = (renewal.refresh_expires_in_secs, get(oauth, "refreshTokenExpiresAt")) {
+        updates.push(("refreshTokenExpiresAt", from_now_ms(secs)));
+    }
+    patch_oauth(&file, &root, &updates).map(Some).ok_or(FetchError::CannotSave)
 }
 
 /// Renews Claude's expired access token with the refresh token stored beside it and
@@ -273,67 +362,18 @@ pub fn refresh_claude(
     before_network: &mut dyn FnMut() -> Result<(), FetchError>,
 ) -> Result<(), FetchError> {
     let path = claude_credentials(env);
-    let file = std::fs::read_to_string(&path).map_err(|_| FetchError::NoCredentials)?;
-    let root = json::parse(&file).ok_or(FetchError::NoCredentials)?;
-    let oauth = get(&root, "claudeAiOauth").ok_or(FetchError::NoCredentials)?;
-    let past = |key: &str| get(oauth, key).and_then(num).is_some_and(|ms| (ms / 1000.0) as i64 <= now);
-    if !past("expiresAt") {
-        // Renewed by someone else since the caller looked.
+    let read = || std::fs::read_to_string(&path).map_err(|_| FetchError::NoCredentials);
+    let file = read()?;
+    let user_agent = claude_user_agent(&env.claude_code_dirs);
+    let Some(plan) = plan_claude_refresh(&file, now, user_agent, &mut || can_replace(&path))? else {
         return Ok(());
-    }
-    let refresh = get(oauth, "refreshToken").and_then(text).filter(|t| token_ok(t)).ok_or(FetchError::Expired)?;
-    if past("refreshTokenExpiresAt") {
-        return Err(FetchError::Expired);
-    }
-    if REJECTED_REFRESH.load(Ordering::Relaxed) == digest(refresh) {
-        // Nothing is sent, so this is a local verdict: the file is looked at again soon
-        // and a new sign-in is picked up as soon as it is stored.
-        return Err(FetchError::Expired);
-    }
-    // Prove the file can be replaced, and that its layout can be patched, before the
-    // server is asked to retire the old refresh token. The stand-ins differ from what
-    // is stored, so a member that cannot take effect (a repeated key, say) shows up.
-    let access = get(oauth, "accessToken").and_then(text).unwrap_or_default();
-    let stand_in = [
-        ("accessToken", json_string(&format!("{access}~"))),
-        ("refreshToken", json_string(&format!("{refresh}~"))),
-        ("expiresAt", "-1".to_string()),
-    ];
-    if !can_replace(&path) || patch_oauth(&file, &root, &stand_in).is_none() {
-        return Err(FetchError::CannotSave);
-    }
+    };
 
     before_network()?;
-    let response = http(&refresh_request(env, oauth, refresh)).map_err(FetchError::Network)?;
-    match response.status {
-        200 => {}
-        400 | 401 | 403 => {
-            REJECTED_REFRESH.store(digest(refresh), Ordering::Relaxed);
-            return Err(FetchError::Unauthorized);
-        }
-        429 => return Err(FetchError::RateLimited(response.retry_after)),
-        other => return Err(FetchError::Http(other)),
-    }
-    let renewal = parse_renewal(&response.body)?;
-
-    // Read the file again: if the refresh token in it is no longer the one used, another
-    // process renewed in the meantime and its tokens are the ones to keep.
-    let file = std::fs::read_to_string(&path).map_err(|_| FetchError::NoCredentials)?;
-    let root = json::parse(&file).ok_or(FetchError::NoCredentials)?;
-    let oauth = get(&root, "claudeAiOauth").ok_or(FetchError::NoCredentials)?;
-    if get(oauth, "refreshToken").and_then(text) != Some(refresh) {
+    let response = http(&plan.request).map_err(FetchError::Network)?;
+    let Some(updated) = finish_claude_refresh(&plan, &response, now, &mut || read())? else {
         return Ok(());
-    }
-    let from_now_ms = |secs: i64| (now.saturating_add(secs)).saturating_mul(1000).to_string();
-    let mut updates = vec![
-        ("accessToken", json_string(&renewal.access_token)),
-        ("refreshToken", json_string(renewal.refresh_token.as_deref().unwrap_or(refresh))),
-        ("expiresAt", from_now_ms(renewal.expires_in_secs)),
-    ];
-    if let (Some(secs), Some(_)) = (renewal.refresh_expires_in_secs, get(oauth, "refreshTokenExpiresAt")) {
-        updates.push(("refreshTokenExpiresAt", from_now_ms(secs)));
-    }
-    let updated = patch_oauth(&file, &root, &updates).ok_or(FetchError::CannotSave)?;
+    };
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(100));
@@ -946,7 +986,7 @@ mod tests {
         let file = r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":5,"clientId":"custom-client"}}"#;
         store(&dir, file);
         let root = json::parse(file).unwrap();
-        let request = refresh_request(&env_in(&dir), get(&root, "claudeAiOauth").unwrap(), "r");
+        let request = refresh_request("ua".to_string(), get(&root, "claudeAiOauth").unwrap(), "r");
         assert_eq!(request.body.as_deref(), Some(r#"{"grant_type":"refresh_token","refresh_token":"r","client_id":"custom-client"}"#));
         std::fs::remove_dir_all(&dir).unwrap();
     }

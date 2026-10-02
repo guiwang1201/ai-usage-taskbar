@@ -7,6 +7,7 @@ final class Prototype: NSObject, NSApplicationDelegate {
     private var loadingCredentials = false
     private var activeTransports: [UsageHTTP] = []
     private var coordinator: FetchCoordinator!
+    private var renewal: ClaudeRenewal!
     private var item: NSStatusItem!
     private let bars = UsageBars(frame: NSRect(x: 0, y: 0, width: 148, height: 22))
     private let popover = NSPopover()
@@ -48,6 +49,14 @@ final class Prototype: NSObject, NSApplicationDelegate {
             let transport = UsageHTTP(configuration: .ephemeral)
             self?.activeTransports.append(transport)
             transport.get(url: url, headers: headers) { result in
+                callback(result)
+                DispatchQueue.main.async { self?.activeTransports.removeAll { $0 === transport } }
+            }
+        }
+        renewal = ClaudeRenewal(runtime: runtime, store: ClaudeStore(), now: { Int64(Date().timeIntervalSince1970) }) { [weak self] url, headers, body, callback in
+            let transport = UsageHTTP(configuration: .ephemeral)
+            self?.activeTransports.append(transport)
+            transport.post(url: url, headers: headers, body: body) { result in
                 callback(result)
                 DispatchQueue.main.async { self?.activeTransports.removeAll { $0 === transport } }
             }
@@ -188,7 +197,8 @@ final class Prototype: NSObject, NSApplicationDelegate {
             let reading = runtime.state.readings[provider]
             let age = reading.map { max(0, now - $0.fetchedAt) }
             let updated = age.map { "\($0 / 60) 分钟前更新" } ?? "暂无数据"
-            sectionStatuses[provider].stringValue = runtime.errors[provider].map { "\($0) · 显示缓存 · \(updated)" } ?? "\(cachedOnly ? "真实缓存" : "模拟数据") · \(updated)"
+            let issue = runtime.issue(provider)
+            sectionStatuses[provider].stringValue = issue.map { reading == nil ? "\($0) · 暂无数据" : "\($0) · 显示缓存 · \(updated)" } ?? "\(cachedOnly ? "真实缓存" : "模拟数据") · \(updated)"
             let values = reading?.values(now: now) ?? [nil, nil]
             for index in 0...1 {
                 if cachedOnly {
@@ -203,7 +213,7 @@ final class Prototype: NSObject, NSApplicationDelegate {
                 }
                 sectionPercentages[provider][index].stringValue = values[index].map { "\(runtime.state.showRemaining == true ? "剩余" : "已用") \(Int((runtime.state.showRemaining == true ? 100 - $0 : $0).rounded()))%" } ?? "--"
                 sectionProgress[provider][index].doubleValue = values[index].map { runtime.state.showRemaining == true ? 100 - $0 : $0 } ?? 0
-                sectionProgress[provider][index].alphaValue = runtime.errors[provider] == nil ? 1 : 0.55
+                sectionProgress[provider][index].alphaValue = issue == nil ? 1 : 0.55
             }
         }
     }
@@ -292,21 +302,36 @@ final class Prototype: NSObject, NSApplicationDelegate {
             ?? (cachedOnly ? [nil, nil] : [fallback.five / 100, fallback.seven / 100])
         bars.remaining = runtime.state.showRemaining == true
         bars.resets = [reading?.fiveReset, reading?.sevenReset]
-        bars.stale = runtime.errors[provider] != nil
+        let issue = runtime.issue(provider)
+        bars.stale = issue != nil
         fitStatusItem()
         let mode = bars.remaining ? "剩余" : "已用"
         let shown = bars.values.map { $0.map { bars.remaining ? 1 - $0 : $0 } }
         let percentageText = shown.map { $0.map { "\(Int(($0 * 100).rounded()))%" } ?? "--" }
-        let summary = "IUsage \(live ? "定时刷新" : cachedOnly ? "真实缓存" : "模拟数据")：\(provider == 0 ? "Claude" : "Codex")，5h \(mode) \(percentageText[0])，7d \(mode) \(percentageText[1])"
+        let summary = "IUsage \(live ? "定时刷新" : cachedOnly ? "真实缓存" : "模拟数据")：\(provider == 0 ? "Claude" : "Codex")，5h \(mode) \(percentageText[0])，7d \(mode) \(percentageText[1])\(issue.map { "（\($0)）" } ?? "")"
         item.button?.setAccessibilityLabel(summary)
         item.button?.toolTip = summary
         if popover.isShown { updateDetails() }
     }
+    private var userAway: Bool {
+        !popover.isShown && CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .null) >= 300
+    }
+    // After a local credential problem nothing was reserved, so the gate says "due
+    // now". Waiting on a separate timer keeps this from becoming a tight loop. It
+    // reads local storage only; the gate still decides whether a request follows.
+    private func scheduleRecheck(after seconds: Int) {
+        timer?.invalidate()
+        let next = Timer(timeInterval: TimeInterval(userAway ? max(seconds, 300) : seconds), target: self, selector: #selector(recheckCredentials), userInfo: nil, repeats: false)
+        next.tolerance = 2
+        RunLoop.main.add(next, forMode: .common)
+        timer = next
+    }
+    @objc private func recheckCredentials() { fetchLive(provider: runtime.state.selectedProvider, honoringSchedule: true) }
     private func scheduleNext() {
         timer?.invalidate()
         guard !cachedOnly || live else { return }
         let now = Int64(Date().timeIntervalSince1970)
-        let due = runtime.nextEvent(provider: runtime.state.selectedProvider, now: now, idle: !popover.isShown && CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .null) >= 300)
+        let due = runtime.nextEvent(provider: runtime.state.selectedProvider, now: now, idle: userAway)
         let next = Timer(timeInterval: TimeInterval(max(1, due - now)), target: self, selector: #selector(mockTick), userInfo: nil, repeats: false)
         next.tolerance = 1
         RunLoop.main.add(next, forMode: .common)
@@ -315,8 +340,7 @@ final class Prototype: NSObject, NSApplicationDelegate {
     @objc private func mockTick() {
         let provider = runtime.state.selectedProvider
         let now = Int64(Date().timeIntervalSince1970)
-        let idle = !popover.isShown && CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .null) >= 300
-        if runtime.nextEvent(provider: provider, now: now, idle: idle) > now { scheduleNext(); return }
+        if runtime.nextEvent(provider: provider, now: now, idle: userAway) > now { scheduleNext(); return }
         if live { fetchLive(provider: provider); return }
         do {
             try runtime.simulate(provider: provider, now: Int64(Date().timeIntervalSince1970), status: 200, body: mockBodies[provider])
@@ -327,38 +351,94 @@ final class Prototype: NSObject, NSApplicationDelegate {
             timer?.invalidate()
         }
     }
-    private func fetchLive(provider: Int) {
+    private func fetchLive(provider: Int, honoringSchedule: Bool = false) {
         guard !loadingCredentials else { return }
         loadingCredentials = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let sources = LocalSources(home: FileManager.default.homeDirectoryForCurrentUser, environment: ProcessInfo.processInfo.environment, reader: CredentialReader())
-            let credential = Result { try provider == 0 ? sources.claude() : sources.codex() }
+            // Claude's stored text is kept with its source: an expired token is renewed
+            // from it and written back to the same place.
+            let claudeRecord = provider == 0 ? Result { try sources.claudeRecord() } : nil
+            let loaded: Result<OAuthCredential, Error> = claudeRecord.map { read in
+                read.flatMap { record in Result { try CredentialReader.parseClaude(record.data, now: Date()) } }
+            } ?? Result { try sources.codex() }
+            let record = try? claudeRecord?.get()
             let version = sources.claudeVersion()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.loadingCredentials = false
+                let credential: OAuthCredential
+                do { credential = try loaded.get() }
+                catch {
+                    if let record, (error as? CredentialFailure) == .expired {
+                        self.renewClaude(record, version: version)
+                        return
+                    }
+                    // Shown, and rechecked locally; no request and no Keychain prompt.
+                    self.hold(provider, LocalIssue(error, provider: provider))
+                    return
+                }
+                if self.runtime.localIssues[provider] != nil {
+                    self.runtime.setLocalIssue(provider, nil)
+                    self.refreshDisplay()
+                }
+                // A recheck only refreshes the credential status; the schedule still
+                // decides when the next request may go out.
+                if honoringSchedule, self.runtime.nextEvent(provider: provider, now: Int64(Date().timeIntervalSince1970), idle: self.userAway) > Int64(Date().timeIntervalSince1970) {
+                    self.scheduleNext()
+                    return
+                }
                 do {
-                    let credential = try credential.get()
                     let started = try self.coordinator.fetch(provider: provider, token: credential.accessToken, account: credential.accountID, claudeVersion: version) { [weak self] error in
                         guard let self else { return }
                         self.updateBars()
-                        if error == nil {
-                            do {
-                                let lines = try self.runtime.consumeAlert(provider: provider, now: Int64(Date().timeIntervalSince1970))
-                                if !lines.isEmpty { SystemFeatures.notify(provider: provider == 0 ? "Claude" : "Codex", lines: lines) }
-                            } catch { self.timer?.invalidate(); return }
-                        }
-                        if error == nil { self.scheduleNext() }
-                        else { self.timer?.invalidate() }
+                        guard error == nil else { self.pause(provider); return }
+                        do {
+                            let lines = try self.runtime.consumeAlert(provider: provider, now: Int64(Date().timeIntervalSince1970))
+                            if !lines.isEmpty { SystemFeatures.notify(provider: provider == 0 ? "Claude" : "Codex", lines: lines) }
+                        } catch { self.pause(provider); return }
+                        self.scheduleNext()
                     }
                     if !started { self.scheduleNext() }
+                } catch UsageHTTP.Failure.invalidEndpoint {
+                    self.hold(provider, .invalidRequestInput)
                 } catch {
-                    // No repeated Keychain prompts or tight local-login retry loop.
-                    self.sectionStatuses[provider].stringValue = "本地凭据不可用 · 自动刷新已暂停"
-                    self.timer?.invalidate()
+                    self.pause(provider)
                 }
             }
         }
+    }
+    private func renewClaude(_ record: ClaudeCredentialRecord, version: String?) {
+        do {
+            try renewal.renew(record: record, version: version) { [weak self] outcome in
+                guard let self else { return }
+                switch outcome {
+                case .notNeeded: self.scheduleRecheck(after: 2)
+                case .wait:
+                    // The gate is holding a limit or the minimum gap; the schedule knows when.
+                    self.runtime.setLocalIssue(0, LocalIssue.awaitingRenewal.label)
+                    self.refreshDisplay()
+                    self.scheduleNext()
+                case .issue(let issue): self.hold(0, issue)
+                case .finished:
+                    self.refreshDisplay()
+                    self.scheduleNext()
+                }
+            }
+        } catch { pause(0) }
+    }
+    private func refreshDisplay() { updateBars(); updateDetails() }
+    private func hold(_ provider: Int, _ issue: LocalIssue) {
+        runtime.setLocalIssue(provider, issue.label)
+        refreshDisplay()
+        scheduleRecheck(after: issue.recheckSeconds)
+    }
+    // The cache could not be saved. Stop instead of looping; a restart or a provider
+    // switch tries again.
+    private func pause(_ provider: Int) {
+        timer?.invalidate()
+        runtime.setLocalIssue(provider, "无法保存缓存 · 自动刷新已暂停")
+        refreshDisplay()
     }
     @objc private func selectProvider() {
         do { try runtime.select(selector.selectedSegment) }

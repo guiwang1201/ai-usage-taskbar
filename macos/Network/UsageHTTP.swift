@@ -22,13 +22,29 @@ final class UsageHTTP: NSObject, URLSessionDataDelegate {
     }
     // Callers reserve and persist the gate before invoking this one-shot adapter.
     func get(url: URL, headers: [String: String], completion: @escaping (Result<Response, Error>) -> Void) {
+        send(method: "GET", url: url, headers: headers, body: nil, completion: completion)
+    }
+    // Only the Claude token renewal posts; the endpoint allowlist below is exact.
+    func post(url: URL, headers: [String: String], body: Data, completion: @escaping (Result<Response, Error>) -> Void) {
+        send(method: "POST", url: url, headers: headers, body: body, completion: completion)
+    }
+    static func allowed(method: String, url: URL) -> Bool {
         guard url.scheme == "https", url.user == nil, url.password == nil, url.port == nil,
-              url.query == nil, url.fragment == nil,
-              (url.host == "api.anthropic.com" && url.path == "/api/oauth/usage") ||
-              (url.host == "chatgpt.com" && url.path == "/backend-api/wham/usage") else {
+              url.query == nil, url.fragment == nil, let host = url.host else { return false }
+        switch (method, host, url.path) {
+        case ("GET", "api.anthropic.com", "/api/oauth/usage"),
+             ("GET", "chatgpt.com", "/backend-api/wham/usage"),
+             ("POST", "platform.claude.com", "/v1/oauth/token"): return true
+        default: return false
+        }
+    }
+    private func send(method: String, url: URL, headers: [String: String], body: Data?, completion: @escaping (Result<Response, Error>) -> Void) {
+        guard Self.allowed(method: method, url: url), body.map({ $0.count <= 65_536 }) ?? true else {
             completion(.failure(Failure.invalidEndpoint)); return
         }
         var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.httpBody = body
         request.allHTTPHeaderFields = headers
         queue.addOperation { [self] in
             guard !used else { completion(.failure(URLError(.resourceUnavailable))); return }
