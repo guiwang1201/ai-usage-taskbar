@@ -1,8 +1,15 @@
 # IUsage
 
-在 Windows 11 任务栏上显示 Claude 或 Codex 的用量：上面一条是 5 小时窗口，下面一条是 7 天窗口。
+在 Windows 11 任务栏和 macOS 菜单栏上显示 Claude 或 Codex 的用量：上面一条是 5 小时窗口，下面一条是 7 天窗口。
 
-单个 exe，约 425 KiB（含应用图标），无运行时依赖；此前实测常驻内存约 4 MB（私有）。
+| | Windows 11 | macOS 13+ |
+|---|---|---|
+| 形态 | 嵌入任务栏的小组件，托盘图标兜底 | 菜单栏项目 |
+| 产物 | 单个 exe，约 425 KiB（含应用图标），无运行时依赖；此前实测常驻内存约 4 MB（私有） | `IUsage.app`，主程序约 660 KiB；尚无可靠的 CPU / 内存测量 |
+| 分发 | 自行构建，exe 无代码签名 | 自行构建，仅本机 ad-hoc 签名，未公证 |
+| 实现 | Rust，`src/` | Swift（AppKit）+ 复用 `src/` 的 Rust 核心，`macos/` |
+
+下面的截图是 Windows 版；Mac 版的界面说明和构建见 [`macos/README.md`](macos/README.md)。
 
 ![任务栏上的进度条](docs/screenshots/claude.png)
 
@@ -13,6 +20,8 @@
 Claude 要注意：桌面端有自己的登录，不会更新 `~/.claude/.credentials.json`，程序读的是这个文件，它来自 Claude Code 命令行的登录。这个文件里的访问令牌约 8 小时过期，过期后程序会用文件里的刷新令牌自行续期（见“数据来源”）；只有刷新令牌也失效时，才需要在终端运行一次 `claude` 并输入 `/login`。
 
 ## 使用
+
+下面是 Windows 版。Mac 版的操作大体一致，差异见本节末尾。
 
 把构建出的 `iusage.exe` 放到一个只有你自己能写的本地文件夹里运行（原因见“安全上要知道的”）。
 
@@ -25,6 +34,14 @@ Claude 要注意：桌面端有自己的登录，不会更新 `~/.claude/.creden
 - **托盘图标**：同样的两条进度条，鼠标悬停看摘要，左键开详情面板，右键出菜单；任务栏嵌入失败时靠它兜底。
 - 进度条颜色按已用量变化：75% 起变黄，90% 起变红。
 - 右侧文字是“百分比 + 距离重置的时间”，例如 `13% 4h`。
+
+**Mac 版的差异**（需要 macOS 13 或更高）：
+
+- 点击字母（`C` / `X`）切换 AI，点其余部分打开详情面板；右键或 Control 点击出菜单：切换 AI、显示已用 / 显示剩余、立即刷新（冷却期间是灰的）、低额度提醒、登录时启动、退出。
+- 没有拖动手柄，位置由系统菜单栏决定；也没有托盘图标。
+- 低额度提醒和登录时启动**默认关闭**（Windows 版的提醒默认开启）。提醒开启时才会申请系统通知权限，阈值同为 75% / 90%；登录时启动用系统的登录项接口，需要先把 app 放到“应用程序”里再勾选。
+- 刷新节奏、最小间隔、限流退避、空闲降频的规则和 Windows 版相同，实现共用同一份 Rust 代码。缓存在 `~/Library/Application Support/IUsage/cache.json`。
+- 本地登录凭据有问题时（未登录、已过期、钥匙串读不出、格式异常）会像 Windows 版一样变暗并写明原因，每隔一会儿重查本地存储，不发请求，也不弹钥匙串授权框。
 
 状态文字：
 
@@ -64,6 +81,8 @@ Claude 要注意：桌面端有自己的登录，不会更新 `~/.claude/.creden
 | Claude | `~/.claude/.credentials.json` | `api.anthropic.com/api/oauth/usage` |
 | Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage` |
 
+Mac 版的接口相同，凭据来源不同：Claude 读登录钥匙串里的 `Claude Code-credentials` 条目，没有时才回退到 `~/.claude/.credentials.json`；Codex 按其配置读文件或钥匙串（`file` / `keyring` / `auto`；较新官方版本的 `secrets` 加密后端暂不支持）。读取一律不弹授权框。
+
 - **Claude 令牌续期**：只在访问令牌已经过期时才做，请求和 Claude Code 自己续期时发的一样：向 `platform.claude.com/v1/oauth/token` 提交文件里的刷新令牌、Claude Code 的 `client_id` 和原有的 scope。成功后把新令牌写回 `~/.claude/.credentials.json`，只替换 `accessToken`、`refreshToken`、`expiresAt`（有则同时替换 `refreshTokenExpiresAt`）四个值，文件其余字节原样保留；写入前会重新解析，结果和预期不一致就不写；写入用临时文件替换。
   - 服务端可能在续期时换发新的刷新令牌，旧的随即作废，所以任何可能写不回去的情况都在请求**之前**检查：文件只读、目录不可写、文件结构异常（如重复键），都直接报 `无法保存`，不发请求。
   - 请求返回后会再读一次文件；如果里面的刷新令牌已经不是用的那个（Claude Code 同时续期了），保留对方的文件，不覆盖。
@@ -78,10 +97,11 @@ Claude 要注意：桌面端有自己的登录，不会更新 `~/.claude/.creden
 
 ## 安全上要知道的
 
-- exe 没有代码签名，拷到别的电脑上运行会被 SmartScreen 拦一下。
-- exe 放在哪个文件夹，就会优先从那个文件夹加载同名的系统库。所以它应该放在只有你自己能写的本地文件夹里，不要放在会被同步或共享的位置。
+- Windows：exe 没有代码签名，拷到别的电脑上运行会被 SmartScreen 拦一下。
+- Windows：exe 放在哪个文件夹，就会优先从那个文件夹加载同名的系统库。所以它应该放在只有你自己能写的本地文件夹里，不要放在会被同步或共享的位置。
+- Mac：app 只有本机 ad-hoc 签名，没有公证；拷到别的 Mac 上会被 Gatekeeper 拦下，请在那台机器上自行构建。
 - 和所有同类工具一样，它读的是官方客户端的登录凭据；能以你的身份运行程序的东西，本来也能读到这些文件。Claude 的续期还会改写这个文件，并让旧的刷新令牌作废；如果你同时在用别的工具读同一个文件，它们会读到新令牌，持有旧令牌副本的工具则需要重新读取。
-- Mac 上 Claude 的凭据可能在钥匙串里而不是这个文件；Mac 版的续期规则与这里共用，写回读取它的同一个位置（钥匙串或文件），细节见 `macos/README.md`。
+- Mac 上 Claude 的凭据通常在钥匙串里而不是这个文件；Mac 版的续期规则与这里共用，写回读取它的同一个位置（钥匙串或文件）。请求前会先确认写得回去，写不回就不发请求，旧刷新令牌保持有效，细节见 `macos/README.md`。
 
 ## 构建
 
@@ -99,7 +119,22 @@ cargo test
 - 更新已安装的版本：先退出正在运行的程序，再用新的 exe 覆盖旧的，然后重新启动。
 - `iusage.exe --check > out.txt` 用于排查：正式程序运行时不另发请求；否则优先使用新鲜缓存，并跳过冷却中的服务。确需刷新时才请求，并保存结果和退避状态。开发验证优先使用离线测试，不要连续运行诊断命令或阶段 0 的探测脚本。
 - `cargo test --offline` 使用模拟响应，不调用真实用量 API。其中一项测试需要写临时注册表键；受限环境可以使用 `cargo test --offline -- --skip value_round_trips_through_the_registry`，再在允许注册表写入的环境单独执行该项。
-- 目前 `src/win/` 之外的代码不依赖 Windows，但 Mac 的界面部分还没写。
+### macOS
+
+需要 Xcode 命令行工具和 Rust。构建目录默认在 OneDrive 外（`/private/tmp/iusage-mac-build`）。首次先下载依赖（只访问包仓库），之后全程离线：
+
+```
+CARGO_HOME=/private/tmp/iusage-mac-build/cargo-home cargo fetch --manifest-path macos/Core/Cargo.toml
+sh macos/scripts/build-prototype.sh
+sh macos/scripts/package-local.sh
+```
+
+- `build-prototype.sh` 先跑全部离线测试（Rust 共享模块与桥接、Swift 凭据、续期、运行层、网络、协调器，使用模拟钥匙串和模拟 HTTP），通过后才生成 app；不会调用真实用量 API。
+- `package-local.sh` 生成 `/private/tmp/iusage-mac-build/release/IUsage.app`：固定 bundle ID、默认启用定时刷新、本机 ad-hoc 签名；只打包和校验签名，不安装也不启动。直接运行构建出的 `IUsage Prototype.app`（不带参数）只显示模拟数据。
+- 启动选项：`--cached` 只显示缓存，`--live` 定时刷新真实数据（打包版默认等同 `--live`）。
+- 详细的设计、验证记录和未完成事项见 [`macos/README.md`](macos/README.md)。
+
+`src/win/` 之外的代码不依赖 Windows，`macos/Core` 直接按路径复用这些文件，没有复制源码。
 
 ## 结构
 
@@ -121,13 +156,23 @@ src/
     autostart.rs 开机自启（当前用户的 Run 注册表项）
     render.rs   绘制（形状自绘，文字用 GDI）
     http.rs     WinHTTP 请求（GET，有请求体时为 POST）
+macos/
+  Core/         Rust 静态库：复用上面不依赖 Windows 的模块，经 C 接口（include/IUsageCore.h）给 Swift 用
+  Credentials/  钥匙串与文件凭据读取、本地凭据问题的状态映射
+  Network/      URLSession 请求适配器、请求协调（先落盘再发送）
+  Runtime/      缓存落盘、续期写回、提醒去重、运行状态
+  Prototype/    AppKit 菜单栏界面
+  *Tests/       离线测试（模拟钥匙串、模拟 HTTP）
+  scripts/      构建与本地打包脚本
 ```
 
-`win/` 以外的部分不依赖 Windows，Mac 版可以直接复用。
+`win/` 以外的 Rust 模块不依赖 Windows，Mac 版通过 `macos/Core` 复用。
 
 ## 现状
 
-只在一台机器上测过：Windows 11（26200），175% 缩放，深色主题，单显示器，任务栏居中。
+每个平台各只在一台机器上测过：Windows 11（26200），175% 缩放，深色主题，单显示器，任务栏居中；Mac 是作者的一台 Apple Silicon 机器。
+
+### Windows
 
 已完成并实测：两家数据获取、任务栏嵌入显示、拖动、点击字母切换、托盘图标、单实例、设置持久化、重启后读缓存、限流后的等待、低额度提醒、详情面板、开机自启的勾选。
 
@@ -140,9 +185,21 @@ src/
 - 浅色主题下的配色
 - 多显示器、睡眠唤醒、连续运行数小时
 
+### macOS
+
+已完成并实测：两家真实数据获取（各经明确授权的一次验证后，改为正常定时刷新）、菜单栏显示、C/X 切换、详情面板、重启后读缓存、单实例、限流等待、本地凭据问题的显示。
+
+还没实测：
+
+- Claude 令牌续期写回钥匙串：逻辑只在模拟钥匙串上测过，系统是否允许写入这条条目还没验证；不允许时会安全失败，显示“已过期 · 凭据无法写回，未自动续期”，不发请求
+- 低额度提醒的系统通知权限与横幅、登录时启动（需要装进“应用程序”后人工验收）
+- 浅色主题、多显示器、睡眠唤醒、连续运行数小时；CPU / 内存没有可靠测量
+
 还没做：
 
-- Mac 版
+- Mac 版的公证与可直接分发的安装包（目前只有本机构建 + ad-hoc 签名）
+- Codex 的 `secrets` 加密存储后端
+- Mac 版没有 `settings.json`，阈值和刷新间隔不能像 Windows 版那样改文件
 
 ## 致谢
 
