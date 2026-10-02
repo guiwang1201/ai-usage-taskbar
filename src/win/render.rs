@@ -115,10 +115,16 @@ impl Surface {
             let mut bits: *mut c_void = null_mut();
             let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
             if bitmap.is_null() || bits.is_null() {
+                if !bitmap.is_null() { DeleteObject(bitmap); }
                 DeleteDC(dc);
                 return None;
             }
             let previous = SelectObject(dc, bitmap);
+            if previous.is_null() || previous as isize == -1 {
+                DeleteObject(bitmap);
+                DeleteDC(dc);
+                return None;
+            }
             Some(Surface { dc, bitmap, previous, bits: bits as *mut u32, w, h })
         }
     }
@@ -179,16 +185,19 @@ pub fn draw_text(target: &mut Surface, scratch: &mut Surface, font: &Font, text:
         Align::Center => DT_CENTER,
         Align::Right => DT_RIGHT,
     };
-    // Only the rows the line can touch are cleared and composited. The margin covers
-    // glyphs that overshoot a rectangle slightly shorter than the font.
+    // Clip drawing to the text rectangle: long errors cannot spill into nearby
+    // labels, and only this rectangle needs clearing and alpha compositing.
     let (width, height) = (target.w as usize, target.h);
-    let first = (rect.top - 8).clamp(0, height) as usize;
-    let last = (rect.bottom + 8).clamp(0, height) as usize;
-    if first >= last {
+    let first = rect.top.clamp(0, height) as usize;
+    let last = rect.bottom.clamp(0, height) as usize;
+    let left = rect.left.clamp(0, target.w) as usize;
+    let right = rect.right.clamp(0, target.w) as usize;
+    if first >= last || left >= right {
         return;
     }
-    let rows = first * width..last * width;
-    scratch.pixels()[rows.clone()].fill(0);
+    for y in first..last {
+        scratch.pixels()[y * width + left..y * width + right].fill(0);
+    }
     unsafe {
         let previous = SelectObject(scratch.dc, font.0);
         SetTextColor(scratch.dc, 0x00FF_FFFF);
@@ -198,16 +207,19 @@ pub fn draw_text(target: &mut Surface, scratch: &mut Surface, font: &Font, text:
             text.as_ptr(),
             text.len() as i32,
             &mut rect,
-            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_NOCLIP | align,
+            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS | align,
         );
         SelectObject(scratch.dc, previous);
         GdiFlush();
     }
     // White on black: any channel is the glyph coverage.
-    for (dst, src) in target.pixels()[rows.clone()].iter_mut().zip(scratch.pixels()[rows].iter()) {
-        let coverage = (*src >> 8) & 0xFF;
-        if coverage != 0 {
-            blend(dst, color, coverage as f32 / 255.0);
+    for y in first..last {
+        let range = y * width + left..y * width + right;
+        for (dst, src) in target.pixels()[range.clone()].iter_mut().zip(scratch.pixels()[range].iter()) {
+            let coverage = (*src >> 8) & 0xFF;
+            if coverage != 0 {
+                blend(dst, color, coverage as f32 / 255.0);
+            }
         }
     }
 }
@@ -240,5 +252,23 @@ mod tests {
         assert_eq!(at(12, 5), 0); // right of the clip
         assert_eq!(at(0, 0), 0); // outside
         assert!(alpha(at(2, 2)) < 255); // rounded corner is only partly covered
+    }
+
+    #[test]
+    fn long_text_stays_inside_its_rectangle() {
+        let mut surface = Surface::new(240, 80).unwrap();
+        let mut scratch = Surface::new(240, 80).unwrap();
+        surface.pixels().fill(0);
+        let font = Font::new(16, false);
+        draw_text(&mut surface, &mut scratch, &font, "HTTP 503: a very long error message",
+            RECT { left: 20, top: 20, right: 100, bottom: 45 }, Align::Left, Color::rgb(255, 255, 255));
+        assert!(surface.pixels().iter().any(|p| *p != 0));
+        for y in 0..80 {
+            for x in 0..240 {
+                if !(20..100).contains(&x) || !(20..45).contains(&y) {
+                    assert_eq!(surface.pixels()[y * 240 + x], 0, "{x}, {y}");
+                }
+            }
+        }
     }
 }

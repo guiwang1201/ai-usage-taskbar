@@ -4,7 +4,7 @@
 use crate::cache::{Cache, Entry};
 use crate::model::{FetchError, Provider, Thresholds, Window};
 use crate::timefmt::{age, clock, countdown_long};
-use crate::view::{describe, used_now, Severity};
+use crate::view::{describe, reset_since, used_now, Severity};
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Row {
@@ -63,16 +63,26 @@ fn section(provider: Provider, entry: Option<&Entry>, error: Option<&FetchError>
     Section {
         provider,
         current: provider == ctx.current,
-        rows: [row("5 小时", usage.five_hour, ctx), row("7 天", usage.seven_day, ctx)],
+        rows: [row("5 小时", usage.five_hour, error.is_some(), ctx), row("7 天", usage.seven_day, error.is_some(), ctx)],
         status,
         failed: error.is_some(),
     }
 }
 
-fn row(name: &'static str, window: Option<Window>, ctx: &Context) -> Row {
+fn row(name: &'static str, window: Option<Window>, failed: bool, ctx: &Context) -> Row {
     let Some(window) = window else {
         return Row { name, value: "--".to_string(), fill: None, severity: Severity::Ok, detail: "暂无数据".to_string() };
     };
+    // After a failed fetch a window that has reset since is not known to be empty.
+    if failed && reset_since(&window, ctx.now) {
+        return Row {
+            name,
+            value: "--".to_string(),
+            fill: None,
+            severity: Severity::Ok,
+            detail: "已重置，当前用量未知".to_string(),
+        };
+    }
     let used = used_now(&window, ctx.now);
     let (what, shown) = if ctx.show_remaining { ("剩余", 100 - used) } else { ("已用", used) };
     let detail = match window.resets_at {
@@ -166,5 +176,18 @@ mod tests {
         assert_eq!(panel[0].rows[0].value, "已用 0%");
         assert_eq!(panel[0].rows[0].detail, "已重置");
         assert_eq!(panel[0].rows[1].detail, "重置时间未知");
+    }
+
+    #[test]
+    fn a_reset_window_is_unknown_while_the_fetch_is_failing() {
+        let mut entry = claude();
+        entry.usage.five_hour = Some(Window { used_pct: 80.0, resets_at: Some(NOW - 10) });
+        let errors = [Some(FetchError::Expired), None];
+        let panel = build(&[Some(entry), None], &errors, &ctx());
+        assert_eq!(panel[0].rows[0].value, "--");
+        assert_eq!(panel[0].rows[0].fill, None);
+        assert_eq!(panel[0].rows[0].detail, "已重置，当前用量未知");
+        // The window that has not reset keeps its number.
+        assert_eq!(panel[0].rows[1].value, "已用 91%");
     }
 }

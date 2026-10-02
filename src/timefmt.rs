@@ -6,18 +6,34 @@ pub fn parse_iso8601(s: &str) -> Option<i64> {
     let n = |r: std::ops::Range<usize>| -> Option<i64> { s.get(r)?.parse().ok() };
     let (y, mo, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
     let (h, mi, se) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    if b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-')
+        || !matches!(b.get(10), Some(b'T' | b't' | b' '))
+        || b.get(13) != Some(&b':') || b.get(16) != Some(&b':')
+        || !(1..=12).contains(&mo) || !(0..24).contains(&h)
+        || !(0..60).contains(&mi) || !(0..60).contains(&se)
+    {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = match mo { 2 => if leap { 29 } else { 28 }, 4 | 6 | 9 | 11 => 30, _ => 31 };
+    if !(1..=days).contains(&d) { return None }
 
     let mut i = 19;
     if b.get(i) == Some(&b'.') {
         i += 1;
+        let start = i;
         while b.get(i).is_some_and(u8::is_ascii_digit) {
             i += 1;
         }
+        if i == start { return None }
     }
     let offset = match b.get(i) {
-        None | Some(b'Z') | Some(b'z') => 0,
+        Some(b'Z' | b'z') if i + 1 == b.len() => 0,
         Some(&sign) if sign == b'+' || sign == b'-' => {
-            let secs = n(i + 1..i + 3)? * 3600 + n(i + 4..i + 6).unwrap_or(0) * 60;
+            if i + 6 != b.len() || b.get(i + 3) != Some(&b':') { return None }
+            let (hours, minutes) = (n(i + 1..i + 3)?, n(i + 4..i + 6)?);
+            if !(0..24).contains(&hours) || !(0..60).contains(&minutes) { return None }
+            let secs = hours * 3600 + minutes * 60;
             if sign == b'-' {
                 -secs
             } else {
@@ -156,6 +172,13 @@ mod tests {
         assert_eq!(parse_iso8601(""), None);
         assert_eq!(parse_iso8601("tomorrow"), None);
         assert_eq!(parse_iso8601("2026-10-01"), None);
+        for bad in ["2026-02-29T00:00:00Z", "2026-13-01T00:00:00Z", "2026-00-01T00:00:00Z",
+            "2026-01-00T00:00:00Z", "2026-01-01T24:00:00Z", "2026/01/01T00:00:00Z",
+            "2026-01-01T00:00:00+08:99", "2026-01-01T00:00:00+08", "2026-01-01T00:00:00Zjunk",
+            "2026-01-01T00:00:00.Z", "2026-01-01T00:00:00"] {
+            assert_eq!(parse_iso8601(bad), None, "{bad}");
+        }
+        assert!(parse_iso8601("2024-02-29T00:00:00Z").is_some());
     }
 
     #[test]

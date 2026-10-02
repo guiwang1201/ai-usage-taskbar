@@ -88,10 +88,15 @@ impl Thresholds {
 pub enum FetchError {
     /// Credential file missing or unreadable: the desktop app is not signed in.
     NoCredentials,
-    /// The stored token is past its expiry; no request was sent.
+    /// The stored token is past its expiry and cannot be renewed: there is no refresh
+    /// token, or it has run out too. No request was sent.
     Expired,
-    /// The service answered 401 or 403 to a token that looked valid.
+    /// The service answered 401 or 403 to a token that looked valid, or turned down the
+    /// refresh token.
     Unauthorized,
+    /// A renewed token could not be written back to the credential file, so it was not
+    /// requested at all.
+    CannotSave,
     /// HTTP 429, with the server's Retry-After in seconds when it sent one.
     RateLimited(Option<u32>),
     Http(u16),

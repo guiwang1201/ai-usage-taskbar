@@ -33,6 +33,60 @@ pub fn size(scale: f32) -> (i32, i32) {
     ((WIDTH * scale).round() as i32, (HEIGHT * scale).round() as i32)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::Entry;
+    use crate::model::{FetchError, Provider, Thresholds, Usage, Window};
+    use crate::panel::{self, Context};
+
+    /// Uses synthetic readings only. Optional BMP output lets a developer inspect
+    /// both themes without starting the application's network polling loop.
+    #[test]
+    fn offline_panel_rendering() {
+        let now = 1_790_860_000;
+        let cache = [Some(Entry {
+            usage: Usage {
+                five_hour: Some(Window { used_pct: 23.0, resets_at: Some(now + 15_800) }),
+                seven_day: Some(Window { used_pct: 91.0, resets_at: Some(now + 248_875) }),
+            },
+            fetched_at: now - 200,
+            announced: [0, 0],
+        }); 2];
+        let errors = [None, Some(FetchError::RateLimited(Some(600)))];
+        let panel = panel::build(&cache, &errors, &Context {
+            current: Provider::Claude, show_remaining: false, thresholds: Thresholds::default(), now, utc_offset: 8 * 3600,
+        });
+        for light in [false, true] {
+            for scale in [1.0, 1.75] {
+                let (w, h) = size(scale);
+                let mut surface = Surface::new(w, h).unwrap();
+                let mut scratch = Surface::new(w, h).unwrap();
+                paint(&mut surface, &mut scratch, &panel, light, scale);
+                assert!(surface.pixels().iter().all(|p| p >> 24 == 255));
+                if let Some(dir) = std::env::var_os("IUSAGE_TEST_RENDER_DIR") {
+                    let dir = std::path::PathBuf::from(dir);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let mut bmp = Vec::new();
+                    bmp.extend_from_slice(b"BM");
+                    bmp.extend_from_slice(&(54 + w as u32 * h as u32 * 4).to_le_bytes());
+                    bmp.extend_from_slice(&[0; 4]);
+                    bmp.extend_from_slice(&54u32.to_le_bytes());
+                    bmp.extend_from_slice(&40u32.to_le_bytes());
+                    bmp.extend_from_slice(&w.to_le_bytes());
+                    bmp.extend_from_slice(&(-h).to_le_bytes());
+                    bmp.extend_from_slice(&1u16.to_le_bytes());
+                    bmp.extend_from_slice(&32u16.to_le_bytes());
+                    bmp.extend_from_slice(&[0; 24]);
+                    for pixel in surface.pixels() { bmp.extend_from_slice(&pixel.to_le_bytes()); }
+                    let name = format!("panel-{}-{}.bmp", if light { "light" } else { "dark" }, (scale * 100.0) as u32);
+                    std::fs::write(dir.join(name), bmp).unwrap();
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Face {
     Title,

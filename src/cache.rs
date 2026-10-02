@@ -8,6 +8,7 @@ use tinyjson::JsonValue;
 use crate::alert::Announced;
 use crate::json::{self, get, num};
 use crate::model::{Provider, Usage, Window};
+use crate::schedule::State;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Entry {
@@ -25,9 +26,7 @@ pub type Cache = [Option<Entry>; 2];
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Stored {
     pub cache: Cache,
-    /// Unix seconds before which the service must not be asked again, per provider:
-    /// set when it rate limited or rejected us, so that a restart does not ask early.
-    pub blocked_until: [i64; 2],
+    pub schedule: [State; 2],
 }
 
 /// A missing or malformed file is an empty cache.
@@ -37,10 +36,20 @@ pub fn load(path: &Path) -> Stored {
     let Some(root) = json::parse(&text) else { return stored };
     for provider in Provider::ALL {
         stored.cache[provider.index()] = get(&root, provider.key()).and_then(entry);
+        stored.schedule[provider.index()].last_attempt = stored.cache[provider.index()].map_or(0, |e| e.fetched_at);
     }
     if let Some(JsonValue::Array(times)) = get(&root, "blocked_until") {
-        for (slot, time) in stored.blocked_until.iter_mut().zip(times) {
-            *slot = num(time).map_or(0, |n| n as i64);
+        for (slot, time) in stored.schedule.iter_mut().zip(times) {
+            slot.blocked_until = num(time).map_or(0, |n| n as i64);
+        }
+    }
+    if let Some(JsonValue::Array(states)) = get(&root, "schedule") {
+        for (slot, state) in stored.schedule.iter_mut().zip(states) {
+            let read = |key| get(state, key).and_then(num).map(|n| n as i64);
+            slot.last_attempt = read("last_attempt").unwrap_or(slot.last_attempt);
+            slot.next_poll = read("next_poll").unwrap_or(0);
+            slot.blocked_until = read("blocked_until").unwrap_or(slot.blocked_until);
+            slot.backoff = read("backoff").unwrap_or(0).clamp(0, 960);
         }
     }
     stored
@@ -68,8 +77,14 @@ pub fn save(path: &Path, stored: &Stored) -> std::io::Result<()> {
             format!("\"{}\":{value}", provider.key())
         })
         .collect();
-    entries.push(format!("\"blocked_until\":[{},{}]", stored.blocked_until[0], stored.blocked_until[1]));
-    std::fs::write(path, format!("{{{}}}\n", entries.join(",")))
+    // Keep the old cooldown field readable by an older executable as well.
+    entries.push(format!("\"blocked_until\":[{},{}]", stored.schedule[0].blocked_until, stored.schedule[1].blocked_until));
+    let states = stored.schedule.map(|s| format!(
+        "{{\"last_attempt\":{},\"next_poll\":{},\"blocked_until\":{},\"backoff\":{}}}",
+        s.last_attempt, s.next_poll, s.blocked_until, s.backoff
+    ));
+    entries.push(format!("\"schedule\":[{}]", states.join(",")));
+    json::write_file(path, &format!("{{{}}}\n", entries.join(",")))
 }
 
 fn window_json(window: Option<Window>) -> String {
@@ -91,7 +106,7 @@ fn entry(value: &JsonValue) -> Option<Entry> {
     }
     Some(Entry {
         announced,
-        fetched_at: num(get(value, "fetched_at")?)? as i64,
+        fetched_at: timestamp(get(value, "fetched_at")?)?,
         usage: Usage {
             five_hour: get(value, "five_hour").and_then(window),
             seven_day: get(value, "seven_day").and_then(window),
@@ -101,9 +116,14 @@ fn entry(value: &JsonValue) -> Option<Entry> {
 
 fn window(value: &JsonValue) -> Option<Window> {
     Some(Window {
-        used_pct: num(get(value, "used_pct")?)?,
-        resets_at: get(value, "resets_at").and_then(num).map(|n| n as i64),
+        used_pct: num(get(value, "used_pct")?).filter(|n| (0.0..=100.0).contains(n))?,
+        resets_at: get(value, "resets_at").and_then(timestamp),
     })
+}
+
+fn timestamp(value: &JsonValue) -> Option<i64> {
+    // Keep corrupt cache values out of date arithmetic (through year 9999).
+    num(value).filter(|n| (0.0..=253_402_300_799.0).contains(n)).map(|n| n as i64)
 }
 
 #[cfg(test)]
@@ -125,14 +145,14 @@ mod tests {
                 }),
                 None,
             ],
-            blocked_until: [1_790_000_300, 0],
+            schedule: [State { last_attempt: 1_790_000_000, blocked_until: 1_790_000_300, backoff: 300, next_poll: 1_790_000_300 }, State::default()],
         };
         save(&path, &stored).unwrap();
         assert_eq!(load(&path), stored);
 
         let other = Stored {
             cache: [None, Some(Entry { fetched_at: 5, announced: [0, 0], usage: Usage::default() })],
-            blocked_until: [0, 77],
+            schedule: [State::default(), State { blocked_until: 77, ..State::default() }],
         };
         save(&path, &other).unwrap();
         assert_eq!(load(&path), other);
@@ -154,7 +174,18 @@ mod tests {
         std::fs::write(&path, r#"{"claude":{"fetched_at":9,"five_hour":null,"seven_day":null},"codex":null}"#).unwrap();
         let stored = load(&path);
         assert_eq!(stored.cache[0].map(|e| e.fetched_at), Some(9));
-        assert_eq!(stored.blocked_until, [0, 0]);
+        assert_eq!(stored.schedule[0].last_attempt, 9);
+        assert_eq!(stored.schedule[0].blocked_until, 0);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn restores_legacy_cooldowns_without_usage_data() {
+        let path = std::env::temp_dir().join(format!("iusage-cache-wait-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"blocked_until":[1000300,0]}"#).unwrap();
+        let stored = load(&path);
+        assert!(!stored.schedule[0].can_request(1_000_000));
+        assert!(stored.schedule[0].can_request(1_000_300));
+        std::fs::remove_file(path).unwrap();
     }
 }

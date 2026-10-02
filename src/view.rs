@@ -52,15 +52,15 @@ pub fn build(
     let rows = match usage {
         Some(usage) => {
             let rows = [
-                row("5h", usage.five_hour, show_remaining, thresholds, now),
-                row("7d", usage.seven_day, show_remaining, thresholds, now),
+                row("5h", usage.five_hour, error, show_remaining, thresholds, now),
+                row("7d", usage.seven_day, error, show_remaining, thresholds, now),
             ];
             let what = if show_remaining { "剩余" } else { "已用" };
-            for (r, w) in rows.iter().zip([usage.five_hour, usage.seven_day]) {
-                let Some((pct, reset)) = r.text.split_once(' ') else { continue };
-                if w.is_none() {
+            for r in &rows {
+                if r.fill.is_none() {
                     continue;
                 }
+                let Some((pct, reset)) = r.text.split_once(' ') else { continue };
                 tip.push_str(&format!("\n{} {what} {pct}", r.label));
                 if reset != "--" {
                     tip.push_str(&format!(" · {reset} 后重置"));
@@ -89,8 +89,24 @@ pub fn used_now(window: &Window, now: i64) -> i64 {
     }
 }
 
-fn row(label: &'static str, window: Option<Window>, show_remaining: bool, thresholds: Thresholds, now: i64) -> Row {
+/// True when the window has reset since the reading was taken. After a failed fetch
+/// nothing is known about the new window: it may well have been used since.
+pub fn reset_since(window: &Window, now: i64) -> bool {
+    window.resets_at.is_some_and(|reset| reset <= now)
+}
+
+fn row(
+    label: &'static str,
+    window: Option<Window>,
+    error: Option<&FetchError>,
+    show_remaining: bool,
+    thresholds: Thresholds,
+    now: i64,
+) -> Row {
     let Some(window) = window else { return empty_row(label, "--") };
+    if let Some(error) = error.filter(|_| reset_since(&window, now)) {
+        return empty_row(label, &short_label(error));
+    }
     let used = used_now(&window, now);
     let shown = if show_remaining { 100 - used } else { used };
     Row {
@@ -110,10 +126,20 @@ fn short_label(error: &FetchError) -> String {
     match error {
         FetchError::NoCredentials => "未登录".to_string(),
         FetchError::Expired | FetchError::Unauthorized => "已过期".to_string(),
+        FetchError::CannotSave => "无法保存".to_string(),
         FetchError::RateLimited(_) => "限流".to_string(),
         FetchError::Network(_) => "离线".to_string(),
         FetchError::Http(code) => format!("HTTP {code}"),
         FetchError::Parse => "错误".to_string(),
+    }
+}
+
+/// Claude's desktop app keeps its own sign-in and does not touch the credential file this
+/// program reads, so opening it does not help; signing in the command-line client does.
+fn relogin(provider: Provider, what: &str) -> String {
+    match provider {
+        Provider::Claude => format!("{what}，请在终端运行 claude 并输入 /login 重新登录"),
+        Provider::Codex => format!("{what}，请在 Codex 里重新登录"),
     }
 }
 
@@ -122,8 +148,9 @@ pub fn describe(provider: Provider, error: &FetchError) -> String {
     let name = provider.name();
     match error {
         FetchError::NoCredentials => format!("未找到 {name} 的登录信息"),
-        FetchError::Expired => format!("登录已过期，打开 {name} 即可恢复"),
-        FetchError::Unauthorized => format!("登录凭据被拒绝，请在 {name} 里重新登录"),
+        FetchError::Expired => relogin(provider, "登录已过期且无法自动续期"),
+        FetchError::Unauthorized => relogin(provider, "登录凭据被拒绝"),
+        FetchError::CannotSave => "已续期登录，但无法写回凭据文件，请检查 ~/.claude/.credentials.json 是否可写".to_string(),
         FetchError::RateLimited(_) => "请求过于频繁，稍后自动重试".to_string(),
         FetchError::Network(_) => "网络不通，请检查代理".to_string(),
         FetchError::Http(code) => format!("服务返回 HTTP {code}"),
@@ -188,7 +215,37 @@ mod tests {
         assert_eq!(view.rows[0].fill, None);
         assert_eq!(view.rows[1].text, "--");
         assert!(!view.stale);
-        assert!(view.tip.ends_with("登录已过期，打开 Claude 即可恢复"));
+        assert!(view.tip.ends_with("登录已过期且无法自动续期，请在终端运行 claude 并输入 /login 重新登录"));
+    }
+
+    #[test]
+    fn a_window_that_reset_while_the_fetch_was_failing_is_unknown_not_zero() {
+        // Both windows reset after the last reading, and the refresh since has failed.
+        let later = NOW + 2 * 86_400;
+        let view = build(Provider::Claude, Some(&usage()), Some(&FetchError::Expired), false, T, later);
+        assert_eq!(view.rows[0].text, "已过期");
+        assert_eq!(view.rows[0].fill, None);
+        assert_eq!(view.rows[1].text, "已过期");
+        assert_eq!(view.rows[1].fill, None);
+        assert!(view.stale);
+        assert_eq!(view.tip, "IUsage · Claude\n登录已过期且无法自动续期，请在终端运行 claude 并输入 /login 重新登录");
+        // A window that has not reset keeps its number, and the reset one is unknown.
+        let view = build(Provider::Claude, Some(&usage()), Some(&FetchError::Http(503)), false, T, NOW + 5 * 3600);
+        assert_eq!(view.rows[0].text, "HTTP 503");
+        assert_eq!(view.rows[1].text, "92% 19h");
+        assert_eq!(view.tip, "IUsage · Claude\n7d 已用 92% · 19h 后重置\n服务返回 HTTP 503");
+        // Without an error the empty window is simply empty.
+        let view = build(Provider::Claude, Some(&usage()), None, false, T, later);
+        assert_eq!(view.rows[0].text, "0% --");
+    }
+
+    #[test]
+    fn sign_in_advice_matches_where_the_credentials_live() {
+        assert!(describe(Provider::Claude, &FetchError::Unauthorized).contains("/login"));
+        assert!(describe(Provider::Codex, &FetchError::Unauthorized).contains("Codex"));
+        assert!(describe(Provider::Claude, &FetchError::CannotSave).contains(".credentials.json"));
+        let view = build(Provider::Claude, None, Some(&FetchError::CannotSave), false, T, NOW);
+        assert_eq!(view.rows[0].text, "无法保存");
     }
 
     #[test]

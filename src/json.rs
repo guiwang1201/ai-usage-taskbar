@@ -2,6 +2,37 @@
 
 use tinyjson::JsonValue;
 
+/// Replace a complete file so a crash cannot leave a truncated settings/cache file.
+pub fn write_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    let temporary = path.with_file_name(name);
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+            let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+            let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
 /// Deepest nesting accepted. The parser recurses once per level, so unbounded nesting
 /// in a file or a response would overflow the stack and take the process down.
 const MAX_DEPTH: usize = 64;
@@ -52,7 +83,7 @@ pub fn get<'a>(value: &'a JsonValue, key: &str) -> Option<&'a JsonValue> {
 
 pub fn num(value: &JsonValue) -> Option<f64> {
     match value {
-        JsonValue::Number(n) => Some(*n),
+        JsonValue::Number(n) if n.is_finite() => Some(*n),
         _ => None,
     }
 }

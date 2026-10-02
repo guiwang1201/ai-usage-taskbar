@@ -1,7 +1,9 @@
-//! HTTPS GET through WinHTTP: no extra code in the binary, and it follows the system proxy.
+//! HTTPS GET and POST through WinHTTP: no extra code in the binary, and it follows the
+//! system proxy.
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Networking::WinHttp::*;
@@ -10,6 +12,23 @@ use super::wide;
 use crate::providers::{Request, Response};
 
 const MAX_BODY: usize = 1 << 20;
+
+fn retry_after(value: &str, now: i64) -> Option<u32> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return value.parse::<u64>().ok().map(|n| n.min(u32::MAX as u64) as u32);
+    }
+    // IMF-fixdate, the HTTP date emitted by current servers. The Windows parser
+    // accepts even malformed strings using current-time defaults, so validate here.
+    if value.len() != 29 || !value.is_ascii() || &value[3..5] != ", " || &value[25..] != " GMT" {
+        return None;
+    }
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let month = months.iter().position(|m| *m == &value[8..11])? + 1;
+    let iso = format!("{}-{month:02}-{}T{}Z", &value[12..16], &value[5..7], &value[17..25]);
+    let unix = crate::timefmt::parse_iso8601(&iso)?;
+    Some(unix.saturating_sub(now).clamp(0, i64::from(u32::MAX)) as u32)
+}
 
 struct Handle(*mut c_void);
 
@@ -25,11 +44,15 @@ fn failed(step: &str) -> String {
     format!("{step} failed ({})", unsafe { GetLastError() })
 }
 
-pub fn get(request: &Request) -> Result<Response, String> {
+/// Sends a POST when the request has a body, a GET otherwise.
+pub fn send(request: &Request) -> Result<Response, String> {
+    let started = Instant::now();
     let agent = wide(&request.user_agent);
     let host = wide(request.host);
     let path = wide(request.path);
-    let verb = wide("GET");
+    let verb = wide(if request.body.is_some() { "POST" } else { "GET" });
+    let body = request.body.as_deref().unwrap_or_default().as_bytes();
+    let body_len = u32::try_from(body.len()).map_err(|_| "Request body too large".to_string())?;
     let headers: String = request.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
     let headers = wide(&headers);
 
@@ -72,7 +95,8 @@ pub fn get(request: &Request) -> Result<Response, String> {
         if WinHttpAddRequestHeaders(req.0, headers.as_ptr(), u32::MAX, WINHTTP_ADDREQ_FLAG_ADD) == 0 {
             return Err(failed("WinHttpAddRequestHeaders"));
         }
-        if WinHttpSendRequest(req.0, null(), 0, null(), 0, 0, 0) == 0 {
+        let data = if body.is_empty() { null() } else { body.as_ptr() as *const c_void };
+        if WinHttpSendRequest(req.0, null(), 0, data, body_len, body_len, 0) == 0 {
             return Err(failed("WinHttpSendRequest"));
         }
         if WinHttpReceiveResponse(req.0, null_mut()) == 0 {
@@ -92,31 +116,60 @@ pub fn get(request: &Request) -> Result<Response, String> {
         {
             return Err(failed("WinHttpQueryHeaders"));
         }
-        // Fails when the header is missing or is a date rather than a number of seconds.
-        let mut seconds: u32 = 0;
-        let mut size = std::mem::size_of::<u32>() as u32;
-        let retry_after = (WinHttpQueryHeaders(
+        // Retry-After can be either seconds or an HTTP date. Both impose a wait.
+        let mut value = [0u16; 128];
+        let mut size = std::mem::size_of_val(&value) as u32;
+        let retry_after = if WinHttpQueryHeaders(
             req.0,
-            WINHTTP_QUERY_RETRY_AFTER | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_QUERY_RETRY_AFTER,
             null(),
-            &mut seconds as *mut u32 as *mut c_void,
+            value.as_mut_ptr() as *mut c_void,
             &mut size,
             null_mut(),
-        ) != 0)
-            .then_some(seconds);
+        ) != 0 {
+            let len = value.iter().position(|c| *c == 0).unwrap_or(value.len());
+            retry_after(&String::from_utf16_lossy(&value[..len]), super::unix_now())
+        } else { None };
+
+        // Error bodies are not used and can be arbitrarily large or slow. In
+        // particular, act on 429 immediately instead of waiting to read its body.
+        if status != 200 {
+            return Ok(Response { status: status as u16, body: String::new(), retry_after });
+        }
 
         let mut body = Vec::new();
         let mut chunk = [0u8; 8192];
         loop {
+            if started.elapsed() >= Duration::from_secs(60) {
+                return Err("Response exceeded total time limit".into());
+            }
             let mut read: u32 = 0;
             if WinHttpReadData(req.0, chunk.as_mut_ptr() as *mut c_void, chunk.len() as u32, &mut read) == 0 {
                 return Err(failed("WinHttpReadData"));
             }
-            if read == 0 || body.len() >= MAX_BODY {
+            if read == 0 {
                 break;
+            }
+            if body.len() + read as usize > MAX_BODY {
+                return Err("Response exceeded size limit".into());
             }
             body.extend_from_slice(&chunk[..read as usize]);
         }
-        Ok(Response { status: status as u16, body: String::from_utf8_lossy(&body).into_owned(), retry_after })
+        let body = String::from_utf8(body).map_err(|_| "Response is not UTF-8".to_string())?;
+        Ok(Response { status: status as u16, body, retry_after })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates_without_network() {
+        assert_eq!(retry_after("600", 0), Some(600));
+        assert_eq!(retry_after("Thu, 01 Oct 2026 17:30:00 GMT", 1_790_875_200), Some(600));
+        assert_eq!(retry_after("Thu, 01 Oct 2026 17:30:00 GMT", 1_790_876_000), Some(0));
+        assert_eq!(retry_after("invalid", 0), None);
+        assert_eq!(retry_after("", 0), None);
     }
 }

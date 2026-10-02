@@ -76,7 +76,7 @@ impl Settings {
             format!("\"warn_pct\": {}", self.thresholds.warn),
             format!("\"crit_pct\": {}", self.thresholds.crit),
         ];
-        std::fs::write(path, format!("{{\n  {}\n}}\n", fields.join(",\n  ")))
+        json::write_file(path, &format!("{{\n  {}\n}}\n", fields.join(",\n  ")))
     }
 }
 

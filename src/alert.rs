@@ -13,6 +13,21 @@ const REARM_MARGIN: i64 = 5;
 /// (0 none, 1 warning, 2 critical).
 pub type Announced = [u8; 2];
 
+/// A newly observed reset can already be above the threshold (e.g. after sleep).
+/// Rearm by window identity as well as by the lower usage observed in `check`.
+pub fn rearm(announced: &mut Announced, previous: &Usage, current: &Usage) {
+    for ((slot, before), after) in announced.iter_mut()
+        .zip([previous.five_hour, previous.seven_day])
+        .zip([current.five_hour, current.seven_day])
+    {
+        if let (Some(before), Some(after)) = (before, after) {
+            if before.resets_at.zip(after.resets_at).is_some_and(|(old, new)| new > old) {
+                *slot = 0;
+            }
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Alert {
     pub critical: bool,
@@ -111,5 +126,16 @@ mod tests {
     fn a_window_past_its_reset_counts_as_empty() {
         let mut announced = [0, 0];
         assert_eq!(check(&mut announced, &usage(95.0, 10.0), T, NOW + 3 * 3600), None);
+    }
+
+    #[test]
+    fn a_new_window_can_already_be_high_when_resuming() {
+        let old = usage(95.0, 95.0);
+        let mut new = old;
+        new.five_hour.as_mut().unwrap().resets_at = Some(NOW + 8 * 3600);
+        let mut announced = [2, 2];
+        rearm(&mut announced, &old, &new);
+        assert_eq!(announced, [0, 2]);
+        assert_eq!(check(&mut announced, &new, T, NOW).unwrap().lines.len(), 1);
     }
 }

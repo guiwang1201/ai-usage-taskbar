@@ -15,7 +15,8 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::*;
@@ -59,16 +60,6 @@ const CMD_AUTOSTART: u32 = 6;
 const CMD_NOTIFY: u32 = 7;
 const CMD_EXIT: u32 = 9;
 
-/// Seconds to wait after a credential problem: re-checking is only a file read.
-const CREDENTIAL_RETRY_SECS: i64 = 15;
-const MAX_BACKOFF_SECS: i64 = 960;
-/// Shortest pause after the service says we are asking too often. Retrying sooner was
-/// seen to keep the limit in place for ten minutes and more.
-const RATE_LIMIT_MIN_SECS: i64 = 300;
-/// Longest pause honoured from a Retry-After header.
-const RATE_LIMIT_MAX_SECS: i64 = 3600;
-/// The HTTP timeouts add up to well under this.
-const FETCH_STUCK_SECS: i64 = 120;
 /// With no keyboard or mouse input for this long, nobody is looking at the widget.
 const IDLE_AFTER_SECS: i64 = 300;
 
@@ -99,9 +90,27 @@ const STALE_FADE: f32 = 0.55;
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
-/// Result handed from the worker thread to the UI thread.
-static FETCHED: Mutex<Option<(Provider, Result<Usage, FetchError>)>> = Mutex::new(None);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
+struct Instance(HANDLE);
+
+impl Instance {
+    fn acquire() -> Option<Self> {
+        let handle = unsafe { CreateMutexW(null(), 0, wide("Local\\IUsage.SingleInstance").as_ptr()) };
+        if handle.is_null() {
+            return None;
+        }
+        let exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        let instance = Self(handle);
+        (!exists).then_some(instance)
+    }
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
 
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -127,8 +136,16 @@ fn app_data_dir() -> PathBuf {
     std::env::var_os("APPDATA").map_or_else(home_dir, PathBuf::from)
 }
 
+/// The Claude desktop app is a packaged (MSIX) app, so what it writes to `%APPDATA%`
+/// really lands in its package folder; the plain path only exists for programs started
+/// from inside the desktop app. Both are looked at.
 fn provider_env() -> Arc<Env> {
-    Arc::new(Env { home: home_dir(), claude_code_dir: app_data_dir().join("Claude").join("claude-code") })
+    const PACKAGED: &str = "Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Roaming";
+    let local = std::env::var_os("LOCALAPPDATA").map_or_else(|| home_dir().join("AppData\\Local"), PathBuf::from);
+    let claude_code_dirs =
+        [app_data_dir(), local.join(PACKAGED)].into_iter().map(|dir| dir.join("Claude").join("claude-code")).collect();
+    let home = home_dir();
+    Arc::new(Env { claude_dir: providers::claude_dir(&home), home, claude_code_dirs })
 }
 
 /// Seconds since the last keyboard or mouse input anywhere on the desktop.
@@ -195,20 +212,11 @@ struct App {
     cache_path: PathBuf,
     error_path: PathBuf,
     env: Arc<Env>,
-    // Per provider, indexed by `Provider::index`: last good reading, last error,
-    // earliest time of the next scheduled request, the current error backoff, and
-    // when the service last answered at all.
+    // Per-provider readings, errors and persisted request timing.
     cache: Cache,
     error: [Option<FetchError>; 2],
-    next_poll: [i64; 2],
-    backoff: [i64; 2],
-    last_response: [i64; 2],
-    /// End of a wait the service imposed (rate limit, rejected token); 0 when none.
-    /// Kept apart from `next_poll` because nothing may override it, and saved to disk
-    /// so that a restart does not cut it short.
-    blocked_until: [i64; 2],
-    fetching: bool,
-    fetch_started: i64,
+    schedule: [schedule::State; 2],
+    fetching: Option<(Provider, JoinHandle<Result<Usage, FetchError>>)>,
     light: bool,
     shown: Option<Shown>,
     drag: Option<Drag>,
@@ -220,27 +228,58 @@ struct App {
 /// Fetches both providers once and prints the result. `iusage --check > out.txt`
 pub fn check() {
     use std::io::Write;
-    let (env, now) = (provider_env(), unix_now());
     let mut out = std::io::stdout();
+    let Some(_instance) = Instance::acquire() else {
+        let _ = writeln!(out, "IUsage is already running; use its cached panel or refresh menu.");
+        return;
+    };
+    let env = provider_env();
+    let dir = app_data_dir().join("IUsage");
+    let path = dir.join("cache.json");
+    let mut stored = cache::load(&path);
+    let settings = Settings::load(&dir.join("settings.json"));
     for provider in Provider::ALL {
-        let line = match providers::fetch(provider, &env, now, http::get) {
+        let now = unix_now();
+        let i = provider.index();
+        if !stored.schedule[i].can_request(now) {
+            let _ = writeln!(out, "{}: skipped (request cooldown)", provider.name());
+            continue;
+        }
+        if stored.cache[i].is_some_and(|e| (0..i64::from(settings.poll_secs)).contains(&now.saturating_sub(e.fetched_at))) {
+            let v = view::build(provider, stored.cache[i].as_ref().map(|e| &e.usage), None, false, settings.thresholds, now);
+            let _ = writeln!(out, "{} (cached): 5h {} | 7d {}", provider.name(), v.rows[0].text, v.rows[1].text);
+            continue;
+        }
+        stored.schedule[i].started(now);
+        if cache::save(&path, &stored).is_err() {
+            let _ = writeln!(out, "{}: skipped (cannot persist request cooldown)", provider.name());
+            continue;
+        }
+        let line = match providers::fetch(provider, &env, now, http::send) {
             Ok(usage) => {
+                let now = unix_now();
+                stored.schedule[i].succeeded(now, settings.poll_secs);
+                let mut announced = stored.cache[i].map_or([0, 0], |e| e.announced);
+                if let Some(previous) = stored.cache[i] {
+                    alert::rearm(&mut announced, &previous.usage, &usage);
+                }
+                stored.cache[i] = Some(Entry { usage, fetched_at: now, announced });
                 let v = view::build(provider, Some(&usage), None, false, Thresholds::default(), now);
                 format!("{}: 5h {} | 7d {}", provider.name(), v.rows[0].text, v.rows[1].text)
             }
-            Err(error) => format!("{}: {error:?}", provider.name()),
+            Err(error) => {
+                stored.schedule[i].failed(&error, unix_now());
+                format!("{}: {error:?}", provider.name())
+            }
         };
+        let _ = cache::save(&path, &stored);
         let _ = writeln!(out, "{line}");
     }
 }
 
 pub fn run() {
+    let Some(_instance) = Instance::acquire() else { return };
     unsafe {
-        let mutex = CreateMutexW(null(), 1, wide("Local\\IUsage.SingleInstance").as_ptr());
-        if mutex.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
-            return;
-        }
-
         let instance = GetModuleHandleW(null());
         let main_class = wide("IUsageMain");
         let widget_class = wide("IUsageWidget");
@@ -280,18 +319,15 @@ pub fn run() {
         let settings_path = settings_dir.join("settings.json");
         let cache_path = settings_dir.join("cache.json");
         let settings = Settings::load(&settings_path);
-        let Stored { cache, blocked_until } = cache::load(&cache_path);
+        let Stored { cache, mut schedule } = cache::load(&cache_path);
         // A reading that is still fresh is shown as is; nothing is requested until it
         // ages out. Times in the future are capped so a clock that was set back cannot
         // stall us. A wait the service imposed on an earlier run carries over as loaded.
         let now = unix_now();
         let poll = settings.poll_secs as i64;
-        let mut next_poll = [0i64; 2];
-        let mut last_response = [0i64; 2];
         for i in 0..2 {
             if let Some(entry) = cache[i] {
-                next_poll[i] = (entry.fetched_at + poll).min(now + poll);
-                last_response[i] = entry.fetched_at.min(now);
+                schedule[i].next_poll = schedule[i].next_poll.max(entry.fetched_at.saturating_add(poll).min(now + poll));
             }
         }
         let app = App {
@@ -307,12 +343,8 @@ pub fn run() {
             env: provider_env(),
             cache,
             error: [None, None],
-            next_poll,
-            backoff: [0, 0],
-            last_response,
-            blocked_until,
-            fetching: false,
-            fetch_started: 0,
+            schedule,
+            fetching: None,
             light: system_uses_light_theme(),
             shown: None,
             drag: None,
@@ -360,7 +392,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             if wparam == PBT_APMRESUMEAUTOMATIC {
                 // Timers do not count time spent asleep: fetch as soon as we are back.
                 // The minimum gap and any wait the service imposed still apply.
-                with_app(|app| app.next_poll = [0, 0]);
+                with_app(|app| app.schedule.iter_mut().for_each(|s| s.next_poll = 0));
             }
             1
         }
@@ -586,6 +618,9 @@ impl App {
     }
 
     unsafe fn tick(&mut self) {
+        // Also consume completion here if PostMessage failed or arrived just before
+        // the worker returned. Never abandon a live worker and launch overlapping I/O.
+        self.on_fetched();
         self.ensure_widget();
         self.fetch_if_due();
         self.refresh();
@@ -596,11 +631,6 @@ impl App {
     /// is picked up when the first one returns.
     fn fetch_if_due(&mut self) {
         let now = unix_now();
-        // A request that has not come back long after every timeout has passed is
-        // written off, so one stuck worker cannot stop all later updates.
-        if self.fetching && now - self.fetch_started > FETCH_STUCK_SECS {
-            self.fetching = false;
-        }
         let current = self.settings.provider;
         let wanted = [Some(current), self.popup.is_some().then_some(current.other())];
         // An open panel means someone is looking, whatever the input timer says.
@@ -608,9 +638,7 @@ impl App {
         for provider in wanted.into_iter().flatten() {
             let i = provider.index();
             let last_success = self.cache[i].map(|entry| entry.fetched_at);
-            if !schedule::told_to_wait(self.blocked_until[i], now)
-                && schedule::poll_due(self.next_poll[i], self.last_response[i], last_success, away, now)
-            {
+            if self.schedule[i].due(last_success, away, now) {
                 self.start_fetch(provider);
             }
         }
@@ -620,14 +648,12 @@ impl App {
     fn can_refresh(&self) -> bool {
         let i = self.settings.provider.index();
         let now = unix_now();
-        !self.fetching
-            && !schedule::told_to_wait(self.blocked_until[i], now)
-            && schedule::gap_elapsed(self.last_response[i], now)
+        self.fetching.is_none() && self.schedule[i].can_request(now)
     }
 
     fn save_cache(&self) {
         // Best effort: without the file a restart just fetches again.
-        let _ = cache::save(&self.cache_path, &Stored { cache: self.cache, blocked_until: self.blocked_until });
+        let _ = cache::save(&self.cache_path, &Stored { cache: self.cache, schedule: self.schedule });
     }
 
     unsafe fn toggle_popup(&mut self) {
@@ -735,9 +761,10 @@ impl App {
     /// Creates the widget if needed and keeps it sized and placed against the tray.
     /// Leaves `widget` null when the taskbar cannot host it; the tray icon still works.
     unsafe fn ensure_widget(&mut self) {
-        if self.drag.is_some() {
+        if self.drag.is_some() && !self.widget.is_null() && IsWindow(self.widget) != 0 {
             return;
         }
+        self.drag = None;
         let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
         let tray = if taskbar.is_null() {
             null_mut()
@@ -782,8 +809,12 @@ impl App {
         }
         if geom != self.geom {
             if (geom.w, geom.h) != (self.geom.w, self.geom.h) {
-                self.surface = Surface::new(w, h);
-                self.scratch = Surface::new(w, h);
+                let (Some(surface), Some(scratch)) = (Surface::new(w, h), Surface::new(w, h)) else {
+                    self.drop_widget();
+                    return;
+                };
+                self.surface = Some(surface);
+                self.scratch = Some(scratch);
             }
             SetWindowPos(self.widget, null_mut(), x, 0, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
             self.geom = geom;
@@ -797,6 +828,9 @@ impl App {
         }
         self.widget = null_mut();
         self.geom = Geom::default();
+        self.surface = None;
+        self.scratch = None;
+        self.drag = None;
     }
 
     /// Repaints the widget, the tray icon and the detail panel if what they show has changed.
@@ -817,11 +851,19 @@ impl App {
             return;
         }
         self.paint(&shown);
+        // Countdown/tooltip text changes do not change the icon's pixels.
+        let same_icon = self.shown.as_ref().is_some_and(|old| {
+            old.light == shown.light && old.view.stale == shown.view.stale
+                && old.view.rows.iter().zip(&shown.view.rows).all(|(a, b)| a.fill == b.fill && a.severity == b.severity)
+        });
         let old_icon = self.icon;
-        self.icon = make_icon(&shown.view.rows, shown.light, shown.view.stale);
+        if !same_icon || self.icon.is_null() {
+            let icon = make_icon(&shown.view.rows, shown.light, shown.view.stale);
+            if !icon.is_null() { self.icon = icon; }
+        }
         self.shown = Some(shown);
         self.set_tray(NIM_MODIFY);
-        if !old_icon.is_null() {
+        if !old_icon.is_null() && old_icon != self.icon {
             DestroyIcon(old_icon);
         }
     }
@@ -936,31 +978,52 @@ impl App {
     }
 
     fn start_fetch(&mut self, provider: Provider) {
-        if self.fetching {
+        let now = unix_now();
+        let i = provider.index();
+        if self.fetching.is_some() || !self.schedule[i].can_request(now) {
             return;
         }
-        self.fetching = true;
-        self.fetch_started = unix_now();
+        self.schedule[i].started(now);
+        let stored = Stored { cache: self.cache, schedule: self.schedule };
+        let cache_path = self.cache_path.clone();
         let env = Arc::clone(&self.env);
         let main = self.main as usize;
         let spawned = std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
-            let result = providers::fetch(provider, &env, unix_now(), http::get);
-            if let Ok(mut slot) = FETCHED.lock() {
-                *slot = Some((provider, result));
-            }
+            // Persist before any HTTP call, off the shared Explorer/UI thread, once even
+            // when a token renewal comes before the usage request. Missing credentials
+            // and ones that cannot be renewed need no disk writes and no HTTP.
+            let persisted = std::cell::Cell::new(false);
+            let persist = || -> Result<(), FetchError> {
+                if !persisted.replace(true) {
+                    cache::save(&cache_path, &stored)
+                        .map_err(|e| FetchError::Network(format!("Cannot persist request cooldown: {e}")))?;
+                }
+                Ok(())
+            };
+            let result = providers::prepare(provider, &env, unix_now(), http::send, &mut || persist()).and_then(|request| {
+                persist()?;
+                providers::send_request(provider, &request, http::send)
+            });
             unsafe { PostMessageW(main as HWND, WM_APP_FETCHED, 0, 0) };
+            result
         });
-        if spawned.is_err() {
-            self.fetching = false;
-            self.next_poll[provider.index()] = unix_now() + CREDENTIAL_RETRY_SECS;
+        match spawned {
+            Ok(worker) => self.fetching = Some((provider, worker)),
+            Err(error) => {
+                let error = FetchError::Network(format!("Cannot start worker: {error}"));
+                self.schedule[i].failed(&error, now);
+                self.error[i] = Some(error);
+                self.save_cache();
+            }
         }
     }
 
     unsafe fn on_fetched(&mut self) {
-        let Some((provider, result)) = FETCHED.lock().ok().and_then(|mut slot| slot.take()) else {
+        if !self.fetching.as_ref().is_some_and(|(_, worker)| worker.is_finished()) {
             return;
-        };
-        self.fetching = false;
+        }
+        let (provider, worker) = self.fetching.take().unwrap();
+        let result = worker.join().unwrap_or_else(|_| Err(FetchError::Network("Worker stopped unexpectedly".into())));
         let now = unix_now();
         let i = provider.index();
         match result {
@@ -971,47 +1034,31 @@ impl App {
                 let mut alert = None;
                 if self.settings.notify {
                     announced = self.cache[i].map_or(announced, |entry| entry.announced);
-                    alert = alert::check(&mut announced, &usage, self.settings.thresholds, now);
+                    if let Some(previous) = self.cache[i] {
+                        alert::rearm(&mut announced, &previous.usage, &usage);
+                    }
+                    if provider == self.settings.provider {
+                        alert = alert::check(&mut announced, &usage, self.settings.thresholds, now);
+                    }
                 }
                 self.cache[i] = Some(Entry { usage, fetched_at: now, announced });
                 self.error[i] = None;
-                self.backoff[i] = 0;
-                self.next_poll[i] = now + self.settings.poll_secs as i64;
-                self.last_response[i] = now;
-                self.blocked_until[i] = 0;
+                self.schedule[i].succeeded(now, self.settings.poll_secs);
                 self.save_cache();
                 if let Some(alert) = alert {
                     self.notify(provider, &alert);
                 }
             }
             Err(error) => {
-                // Problems on this machine never reached the service, so they do not
-                // count towards the gap between requests and can be re-checked quickly.
-                let local = matches!(error, FetchError::NoCredentials | FetchError::Expired | FetchError::Network(_));
-                let wait = match error {
-                    FetchError::NoCredentials | FetchError::Expired => CREDENTIAL_RETRY_SECS,
-                    _ => {
-                        self.backoff[i] = if self.backoff[i] == 0 { 30 } else { (self.backoff[i] * 2).min(MAX_BACKOFF_SECS) };
-                        match error {
-                            FetchError::RateLimited(retry_after) => self.backoff[i]
-                                .max(RATE_LIMIT_MIN_SECS)
-                                .max((retry_after.unwrap_or(0) as i64).min(RATE_LIMIT_MAX_SECS)),
-                            // A token the service rejects stays rejected until the
-                            // provider's own app replaces it; hammering does not help.
-                            FetchError::Unauthorized => self.backoff[i].max(RATE_LIMIT_MIN_SECS),
-                            _ => self.backoff[i],
-                        }
-                    }
-                };
+                self.schedule[i].failed(&error, now);
                 // One line for troubleshooting; the file's own timestamp says when.
-                let _ = std::fs::write(&self.error_path, format!("{}: {error:?}\n", provider.name()));
-                self.error[i] = Some(error);
-                self.next_poll[i] = now + wait;
-                if !local {
-                    self.last_response[i] = now;
+                // An unchanged missing credential should not rewrite the disk every 15s.
+                if self.error[i].as_ref() != Some(&error) {
+                    let _ = std::fs::write(&self.error_path, format!("{}: {error:?}\n", provider.name()));
                 }
-                if matches!(self.error[i], Some(FetchError::RateLimited(_) | FetchError::Unauthorized)) {
-                    self.blocked_until[i] = now + wait;
+                let local = matches!(error, FetchError::NoCredentials | FetchError::Expired);
+                self.error[i] = Some(error);
+                if !local {
                     self.save_cache();
                 }
             }
@@ -1035,7 +1082,6 @@ impl App {
                 // because things may have changed while the menu was open.
                 if self.can_refresh() {
                     let provider = self.settings.provider;
-                    self.backoff[provider.index()] = 0;
                     self.start_fetch(provider);
                 }
             }
