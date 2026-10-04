@@ -99,6 +99,14 @@ pub enum FetchError {
     CannotSave,
     /// HTTP 429, with the server's Retry-After in seconds when it sent one.
     RateLimited(Option<u32>),
+    /// Refresh failed without proof that the refresh token is permanently invalid.
+    RefreshTemporary(u16),
+    WebCredentials,
+    WebUnauthorized,
+    WebForbidden,
+    WebOrganization,
+    /// Restored cooldown proves the previous request failed; detailed errors are not persisted.
+    PreviousFailure,
     Http(u16),
     Network(String),
     Parse,

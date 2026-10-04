@@ -9,6 +9,7 @@ mod autostart;
 mod http;
 mod popup;
 mod render;
+mod web_login;
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -46,6 +47,7 @@ use render::{draw_text, Align, Canvas, Color, Font, Surface};
 
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_FETCHED: u32 = WM_APP + 2;
+const WM_APP_WEB_LOGIN: u32 = WM_APP + 3;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 const TICK_TIMER: usize = 1;
 const TICK_MS: u32 = 2000;
@@ -59,6 +61,9 @@ const CMD_REFRESH: u32 = 5;
 const CMD_AUTOSTART: u32 = 6;
 const CMD_NOTIFY: u32 = 7;
 const CMD_EXIT: u32 = 9;
+const CMD_SOURCE_CODE: u32 = 10;
+const CMD_SOURCE_WEB: u32 = 11;
+const CMD_WEB_CONFIG: u32 = 12;
 
 /// With no keyboard or mouse input for this long, nobody is looking at the widget.
 const IDLE_AFTER_SECS: i64 = 300;
@@ -216,7 +221,9 @@ struct App {
     cache: Cache,
     error: [Option<FetchError>; 2],
     schedule: [schedule::State; 2],
-    fetching: Option<(Provider, JoinHandle<Result<Usage, FetchError>>)>,
+    fetching: Option<(Provider, JoinHandle<Result<(Usage, cache::Source), FetchError>>)>,
+    discard_claude_result: bool,
+    web_expired: bool,
     light: bool,
     shown: Option<Shown>,
     drag: Option<Drag>,
@@ -239,6 +246,10 @@ pub fn check() {
     let mut stored = cache::load(&path);
     let settings = Settings::load(&dir.join("settings.json"));
     for provider in Provider::ALL {
+        if provider == Provider::Claude && stored.web_expired && web_login::is_web(&settings) {
+            let _ = writeln!(out, "Claude: web login expired; update login information in the menu.");
+            continue;
+        }
         let now = unix_now();
         let i = provider.index();
         if !stored.schedule[i].can_request(now) {
@@ -255,20 +266,23 @@ pub fn check() {
             let _ = writeln!(out, "{}: skipped (cannot persist request cooldown)", provider.name());
             continue;
         }
-        let line = match providers::fetch(provider, &env, now, http::send) {
-            Ok(usage) => {
+        let session = if provider == Provider::Claude { web_login::selected(&settings) } else { Ok(None) };
+        let result = session.and_then(|session| providers::fetch_selected(provider, &env, now, http::send, session.as_ref(), &mut || Ok(())));
+        let line = match result {
+            Ok((usage, source)) => {
                 let now = unix_now();
                 stored.schedule[i].succeeded(now, settings.poll_secs);
                 let mut announced = stored.cache[i].map_or([0, 0], |e| e.announced);
                 if let Some(previous) = stored.cache[i] {
                     alert::rearm(&mut announced, &previous.usage, &usage);
                 }
-                stored.cache[i] = Some(Entry { usage, fetched_at: now, announced });
+                stored.cache[i] = Some(Entry { usage, source, fetched_at: now, announced });
                 let v = view::build(provider, Some(&usage), None, false, Thresholds::default(), now);
                 format!("{}: 5h {} | 7d {}", provider.name(), v.rows[0].text, v.rows[1].text)
             }
             Err(error) => {
                 stored.schedule[i].failed(&error, unix_now());
+                if provider == Provider::Claude { cache::mark_web_expired(&mut stored.web_expired, &error); }
                 format!("{}: {error:?}", provider.name())
             }
         };
@@ -319,7 +333,7 @@ pub fn run() {
         let settings_path = settings_dir.join("settings.json");
         let cache_path = settings_dir.join("cache.json");
         let settings = Settings::load(&settings_path);
-        let Stored { cache, mut schedule } = cache::load(&cache_path);
+        let Stored { cache, mut schedule, web_expired } = cache::load(&cache_path);
         // A reading that is still fresh is shown as is; nothing is requested until it
         // ages out. Times in the future are capped so a clock that was set back cannot
         // stall us. A wait the service imposed on an earlier run carries over as loaded.
@@ -330,6 +344,8 @@ pub fn run() {
                 schedule[i].next_poll = schedule[i].next_poll.max(entry.fetched_at.saturating_add(poll).min(now + poll));
             }
         }
+        let mut errors = schedule.map(|gate| (gate.backoff > 0).then_some(FetchError::PreviousFailure));
+        if web_expired && web_login::is_web(&settings) { errors[0] = Some(FetchError::WebUnauthorized); }
         let app = App {
             main,
             widget: null_mut(),
@@ -342,9 +358,11 @@ pub fn run() {
             error_path: settings_dir.join("last-error.txt"),
             env: provider_env(),
             cache,
-            error: [None, None],
+            error: errors,
             schedule,
             fetching: None,
+            discard_claude_result: false,
+            web_expired,
             light: system_uses_light_theme(),
             shown: None,
             drag: None,
@@ -378,12 +396,17 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             with_app(|app| app.on_fetched());
             0
         }
+        WM_APP_WEB_LOGIN => {
+            with_app(|app| app.set_claude_source(wparam == 1));
+            0
+        }
         WM_APP_TRAY => {
             match lparam as u32 & 0xFFFF {
                 WM_LBUTTONUP => {
                     with_app(|app| app.toggle_popup());
                 }
                 WM_RBUTTONUP => menu(hwnd),
+                NIN_BALLOONUSERCLICK => { with_app(|app| { if app.web_expired { app.open_web_config(); } }); }
                 _ => {}
             }
             0
@@ -453,6 +476,22 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 
 unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_LBUTTONUP => {
+            with_app(|app| {
+                let hit = app.popup.as_ref().is_some_and(|p| p.shown.as_ref().is_some_and(|(panel, _)|
+                    popup::update_hit(panel, (lparam & 0xffff) as i16 as i32, ((lparam >> 16) & 0xffff) as i16 as i32, p.scale)));
+                if hit { app.open_web_config(); app.close_popup(); }
+            });
+            0
+        }
+        WM_KEYDOWN if wparam == 13 => {
+            with_app(|app| {
+                if app.popup.as_ref().is_some_and(|p| p.shown.as_ref().is_some_and(|(panel, _)| panel[0].update_login)) {
+                    app.open_web_config(); app.close_popup();
+                }
+            });
+            0
+        }
         WM_PAINT => {
             if with_app(|app| app.blit_popup(hwnd)).is_none() {
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -488,8 +527,8 @@ unsafe fn utc_offset_secs() -> i64 {
 /// Shows the context menu at the cursor and applies the choice. The menu runs its own
 /// message loop, so the app state must not be borrowed while it is open.
 unsafe fn menu(owner: HWND) {
-    let Some((provider, show_remaining, notify, can_refresh)) = with_app(|app| {
-        (app.settings.provider, app.settings.show_remaining, app.settings.notify, app.can_refresh())
+    let Some((provider, show_remaining, notify, can_refresh, web, expired)) = with_app(|app| {
+        (app.settings.provider, app.settings.show_remaining, app.settings.notify, app.can_refresh(), web_login::is_web(&app.settings), app.web_expired)
     }) else {
         return;
     };
@@ -500,6 +539,14 @@ unsafe fn menu(owner: HWND) {
     };
     item(CMD_CLAUDE, "Claude");
     item(CMD_CODEX, "Codex");
+    if web && expired { item(CMD_WEB_CONFIG, "Claude 登录已失效：更新登录…"); }
+    let sources = CreatePopupMenu();
+    AppendMenuW(sources, MF_STRING, CMD_SOURCE_CODE as usize, wide("Claude Code 登录").as_ptr());
+    AppendMenuW(sources, MF_STRING, CMD_SOURCE_WEB as usize, wide("Claude 网页登录").as_ptr());
+    AppendMenuW(sources, MF_SEPARATOR, 0, null());
+    AppendMenuW(sources, MF_STRING, CMD_WEB_CONFIG as usize, wide("配置 / 更新网页登录…").as_ptr());
+    CheckMenuRadioItem(sources, CMD_SOURCE_CODE, CMD_SOURCE_WEB, if web {CMD_SOURCE_WEB} else {CMD_SOURCE_CODE}, MF_BYCOMMAND);
+    AppendMenuW(menu, MF_POPUP, sources as usize, wide("Claude 数据来源").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     item(CMD_USED, "显示已用");
     item(CMD_REMAINING, "显示剩余");
@@ -648,12 +695,12 @@ impl App {
     fn can_refresh(&self) -> bool {
         let i = self.settings.provider.index();
         let now = unix_now();
-        self.fetching.is_none() && self.schedule[i].can_request(now)
+        self.fetching.is_none() && !(i == 0 && self.web_expired && web_login::is_web(&self.settings)) && self.schedule[i].can_request(now)
     }
 
     fn save_cache(&self) {
         // Best effort: without the file a restart just fetches again.
-        let _ = cache::save(&self.cache_path, &Stored { cache: self.cache, schedule: self.schedule });
+        let _ = cache::save(&self.cache_path, &Stored { cache: self.cache, schedule: self.schedule, web_expired: self.web_expired });
     }
 
     unsafe fn toggle_popup(&mut self) {
@@ -740,7 +787,24 @@ impl App {
             now: unix_now(),
             utc_offset: utc_offset_secs(),
         };
-        let content = (panel::build(&self.cache, &self.error, &context), self.light);
+        let mut sections = panel::build(&self.cache, &self.error, &context);
+        for section in &mut sections {
+            let gate = self.schedule[section.provider.index()];
+            if schedule::told_to_wait(gate.blocked_until, context.now) {
+                section.retry = format!("等待至 {} · {}", crate::timefmt::clock(gate.blocked_until, context.now, context.utc_offset),
+                    crate::timefmt::countdown_long(gate.blocked_until - context.now));
+                if gate.backoff > 0 && self.error[section.provider.index()].is_none() {
+                    section.status = "上次请求失败，保留缓存并继续等待".into();
+                    section.failed = true;
+                }
+            }
+            if section.provider == Provider::Claude && self.web_expired && web_login::is_web(&self.settings) {
+                section.retry = if gate.blocked_until > context.now {
+                    format!("更新登录后仍需等待至 {}", crate::timefmt::clock(gate.blocked_until, context.now, context.utc_offset))
+                } else { "已暂停请求，更新登录后恢复".into() };
+            }
+        }
+        let content = (sections, self.light);
         if popup.shown.as_ref() == Some(&content) {
             return;
         }
@@ -838,7 +902,7 @@ impl App {
         self.refresh_popup();
         let provider = self.settings.provider;
         let i = provider.index();
-        let view = view::build(
+        let mut view = view::build(
             provider,
             self.cache[i].as_ref().map(|entry| &entry.usage),
             self.error[i].as_ref(),
@@ -846,6 +910,13 @@ impl App {
             self.settings.thresholds,
             unix_now(),
         );
+        if let Some(entry) = self.cache[i] {
+            view.tip.push_str(&format!("\n{} · 上次成功 {}", entry.source.label(), crate::timefmt::clock(entry.fetched_at, unix_now(), utc_offset_secs())));
+        }
+        if schedule::told_to_wait(self.schedule[i].blocked_until, unix_now()) {
+            view.tip.push_str(&format!("\n等待至 {}", crate::timefmt::clock(self.schedule[i].blocked_until, unix_now(), utc_offset_secs())));
+            view.stale |= self.cache[i].is_some() && self.schedule[i].backoff > 0;
+        }
         let shown = Shown { view, light: self.light };
         if self.shown.as_ref() == Some(&shown) {
             return;
@@ -978,15 +1049,17 @@ impl App {
     }
 
     fn start_fetch(&mut self, provider: Provider) {
+        if provider == Provider::Claude && self.web_expired && web_login::is_web(&self.settings) { return; }
         let now = unix_now();
         let i = provider.index();
         if self.fetching.is_some() || !self.schedule[i].can_request(now) {
             return;
         }
         self.schedule[i].started(now);
-        let stored = Stored { cache: self.cache, schedule: self.schedule };
+        let stored = Stored { cache: self.cache, schedule: self.schedule, web_expired: self.web_expired };
         let cache_path = self.cache_path.clone();
         let env = Arc::clone(&self.env);
+        let settings = self.settings.clone();
         let main = self.main as usize;
         let spawned = std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
             // Persist before any HTTP call, off the shared Explorer/UI thread, once even
@@ -1000,10 +1073,8 @@ impl App {
                 }
                 Ok(())
             };
-            let result = providers::prepare(provider, &env, unix_now(), http::send, &mut || persist()).and_then(|request| {
-                persist()?;
-                providers::send_request(provider, &request, http::send)
-            });
+            let session = if provider == Provider::Claude { web_login::selected(&settings) } else { Ok(None) };
+            let result = session.and_then(|session| providers::fetch_selected(provider, &env, unix_now(), http::send, session.as_ref(), &mut || persist()));
             unsafe { PostMessageW(main as HWND, WM_APP_FETCHED, 0, 0) };
             result
         });
@@ -1026,8 +1097,18 @@ impl App {
         let result = worker.join().unwrap_or_else(|_| Err(FetchError::Network("Worker stopped unexpectedly".into())));
         let now = unix_now();
         let i = provider.index();
+        if provider == Provider::Claude && self.discard_claude_result {
+            self.discard_claude_result = false;
+            match result {
+                Ok(_) => self.schedule[i].succeeded(now, self.settings.poll_secs),
+                Err(ref error) => self.schedule[i].failed(error, now),
+            }
+            self.save_cache();
+            self.refresh();
+            return;
+        }
         match result {
-            Ok(usage) => {
+            Ok((usage, source)) => {
                 // While notifications are off nothing counts as announced, so turning
                 // them on reports the current state at the next reading.
                 let mut announced = [0, 0];
@@ -1041,7 +1122,8 @@ impl App {
                         alert = alert::check(&mut announced, &usage, self.settings.thresholds, now);
                     }
                 }
-                self.cache[i] = Some(Entry { usage, fetched_at: now, announced });
+                self.cache[i] = Some(Entry { usage, source, fetched_at: now, announced });
+                if provider == Provider::Claude && source == cache::Source::Web { self.web_expired = false; }
                 self.error[i] = None;
                 self.schedule[i].succeeded(now, self.settings.poll_secs);
                 self.save_cache();
@@ -1051,6 +1133,7 @@ impl App {
             }
             Err(error) => {
                 self.schedule[i].failed(&error, now);
+                let login_notice = provider == Provider::Claude && cache::mark_web_expired(&mut self.web_expired, &error);
                 // One line for troubleshooting; the file's own timestamp says when.
                 // An unchanged missing credential should not rewrite the disk every 15s.
                 if self.error[i].as_ref() != Some(&error) {
@@ -1061,6 +1144,14 @@ impl App {
                 if !local {
                     self.save_cache();
                 }
+                if login_notice {
+                    let mut data = self.tray_data();
+                    data.uFlags = NIF_INFO;
+                    copy_wide(&mut data.szInfoTitle, "Claude 网页登录已失效");
+                    copy_wide(&mut data.szInfo, "已保留上次额度并暂停请求。点击此通知更新登录信息，也可从右键菜单进入。");
+                    data.dwInfoFlags = NIIF_WARNING;
+                    Shell_NotifyIconW(NIM_MODIFY, &data);
+                }
             }
         }
         // The user may have switched while this request was in flight.
@@ -1070,6 +1161,12 @@ impl App {
 
     unsafe fn on_command(&mut self, command: u32) {
         match command {
+            CMD_SOURCE_CODE => self.set_claude_source(false),
+            CMD_SOURCE_WEB => {
+                if web_login::load().is_ok() { self.set_claude_source(true); }
+                else { self.open_web_config(); }
+            }
+            CMD_WEB_CONFIG => self.open_web_config(),
             CMD_CLAUDE => self.set_provider(Provider::Claude),
             CMD_CODEX => self.set_provider(Provider::Codex),
             CMD_USED | CMD_REMAINING => {
@@ -1095,6 +1192,37 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn open_web_config(&self) {
+        let gate = self.schedule[Provider::Claude.index()];
+        let waiting = if gate.blocked_until > unix_now() {
+            format!("原等待截止：{}。", crate::timefmt::clock(gate.blocked_until, unix_now(), unsafe { utc_offset_secs() }))
+        } else { "已有缓存和刷新间隔仍然有效。".into() };
+        web_login::open(self.main, waiting, self.web_expired);
+    }
+
+    unsafe fn set_claude_source(&mut self, web: bool) {
+        let mut settings = self.settings.clone();
+        settings.claude_web = Some(web);
+        if settings.save(&self.settings_path).is_err() {
+            let mut data = self.tray_data();
+            data.uFlags = NIF_INFO;
+            copy_wide(&mut data.szInfoTitle, "无法切换 Claude 数据来源");
+            copy_wide(&mut data.szInfo, "渠道设置无法保存，请检查 IUsage 设置目录的写入权限后重试。");
+            data.dwInfoFlags = NIIF_WARNING;
+            Shell_NotifyIconW(NIM_MODIFY, &data);
+            return;
+        }
+        self.settings = settings;
+        self.web_expired = false;
+        // Credentials may refer to a different account. Never label the old result as new.
+        self.cache[0] = None;
+        self.error[0] = None;
+        self.discard_claude_result = self.fetching.as_ref().is_some_and(|(p, _)| *p == Provider::Claude);
+        self.save_cache();
+        self.refresh();
+        // The normal timer applies the unchanged persisted gate and poll schedule.
     }
 
     unsafe fn set_provider(&mut self, provider: Provider) {

@@ -9,6 +9,11 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 tinyjson = "=2.5.1"
 
+# Allows offline verification of the shared Rust core on the Windows development host.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = ["Win32_Foundation", "Win32_Storage_FileSystem"]
+
 [profile.release]
 opt-level = "z"
 lto = true

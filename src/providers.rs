@@ -14,6 +14,9 @@ use crate::json::{self, get, num, text};
 use crate::model::{FetchError, Provider, Usage, Window};
 use crate::timefmt::parse_iso8601;
 
+#[path = "providers/web.rs"]
+pub mod web;
+
 const USER_AGENT: &str = concat!("iusage/", env!("CARGO_PKG_VERSION"));
 /// Used when no installed Claude Code version can be found.
 const FALLBACK_CLAUDE_CODE_VERSION: &str = "2.1.284";
@@ -42,7 +45,7 @@ pub struct Env {
 /// a body.
 pub struct Request {
     pub host: &'static str,
-    pub path: &'static str,
+    pub path: String,
     pub user_agent: String,
     pub headers: Vec<(&'static str, String)>,
     pub body: Option<String>,
@@ -57,6 +60,22 @@ pub struct Response {
 
 /// Platform HTTP client.
 pub type Http = fn(&Request) -> Result<Response, String>;
+
+/// Select locally before any I/O. A failure never triggers another channel.
+pub fn fetch_selected(provider: Provider, env: &Env, now: i64, http: Http,
+    session: Option<&web::Session>, before_network: &mut dyn FnMut() -> Result<(), FetchError>,
+) -> Result<(Usage, crate::cache::Source), FetchError> {
+    if provider == Provider::Claude {
+        if let Some(session) = session {
+            return web::fetch(session, http, before_network).map(|usage| (usage, crate::cache::Source::Web));
+        }
+    }
+    let request = prepare(provider, env, now, http, before_network)?;
+    before_network()?;
+    send_request(provider, &request, http).map(|usage| (usage, if provider == Provider::Claude {
+        crate::cache::Source::OAuth
+    } else { crate::cache::Source::Codex }))
+}
 
 pub fn fetch(provider: Provider, env: &Env, now: i64, http: Http) -> Result<Usage, FetchError> {
     let request = prepare(provider, env, now, http, &mut || Ok(()))?;
@@ -158,7 +177,7 @@ pub fn build_request(provider: Provider, env: &Env, now: i64) -> Result<Request,
             }
             Ok(Request {
                 host: "api.anthropic.com",
-                path: "/api/oauth/usage",
+                path: "/api/oauth/usage".into(),
                 user_agent: claude_user_agent(&env.claude_code_dirs),
                 headers: vec![
                     ("Authorization", format!("Bearer {token}")),
@@ -182,7 +201,7 @@ pub fn build_request(provider: Provider, env: &Env, now: i64) -> Result<Request,
             }
             Ok(Request {
                 host: "chatgpt.com",
-                path: "/backend-api/wham/usage",
+                path: "/backend-api/wham/usage".into(),
                 user_agent: USER_AGENT.to_string(),
                 headers,
                 body: None,
@@ -251,7 +270,7 @@ fn refresh_request(user_agent: String, oauth: &JsonValue, refresh_token: &str) -
     body.push('}');
     Request {
         host: CLAUDE_TOKEN_HOST,
-        path: CLAUDE_TOKEN_PATH,
+        path: CLAUDE_TOKEN_PATH.into(),
         user_agent,
         headers: vec![("Content-Type", "application/json".to_string()), ("Accept", "application/json".to_string())],
         body: Some(body),
@@ -318,12 +337,14 @@ pub fn finish_claude_refresh(
 ) -> Result<Option<String>, FetchError> {
     match response.status {
         200 => {}
-        400 | 401 | 403 => {
+        400 | 401 if json::parse(&response.body)
+            .and_then(|root| get(&root, "error").and_then(text).map(|s| s.eq_ignore_ascii_case("invalid_grant")))
+            .unwrap_or(false) => {
             REJECTED_REFRESH.store(digest(&plan.refresh), Ordering::Relaxed);
             return Err(FetchError::Unauthorized);
         }
         429 => return Err(FetchError::RateLimited(response.retry_after)),
-        other => return Err(FetchError::Http(other)),
+        other => return Err(FetchError::RefreshTemporary(other)),
     }
     let renewal = parse_renewal(&response.body)?;
 
@@ -667,7 +688,7 @@ mod tests {
     #[test]
     fn http_errors_keep_the_retry_information_without_live_requests() {
         let request =
-            Request { host: "unused.invalid", path: "/", user_agent: String::new(), headers: Vec::new(), body: None };
+            Request { host: "unused.invalid", path: "/".into(), user_agent: String::new(), headers: Vec::new(), body: None };
         let limited: Http = |_| Ok(Response { status: 429, body: String::new(), retry_after: Some(600) });
         assert_eq!(send_request(Provider::Claude, &request, limited), Err(FetchError::RateLimited(Some(600))));
         let denied: Http = |_| Ok(Response { status: 401, body: String::new(), retry_after: None });
@@ -683,7 +704,7 @@ mod tests {
 
     struct Call {
         host: &'static str,
-        path: &'static str,
+        path: String,
         user_agent: String,
         headers: Vec<(&'static str, String)>,
         body: Option<String>,
@@ -708,7 +729,7 @@ mod tests {
             let mut network = network.borrow_mut();
             network.calls.push(Call {
                 host: request.host,
-                path: request.path,
+                path: request.path.clone(),
                 user_agent: request.user_agent.clone(),
                 headers: request.headers.clone(),
                 body: request.body.clone(),
@@ -868,7 +889,7 @@ mod tests {
         let dir = workdir("refused");
         let before = credentials("refresh-refused", NOW - 60);
         store(&dir, &before);
-        serve(Ok((400, String::new(), None)));
+        serve(Ok((400, r#"{"error":"invalid_grant"}"#.to_string(), None)));
         // The refusal itself is a server answer and gets the usual wait; asking again
         // with the same token is then a local verdict.
         assert_eq!(fetch(Provider::Claude, &env_in(&dir), NOW, fake_http), Err(FetchError::Unauthorized));
@@ -895,7 +916,7 @@ mod tests {
             fetch(Provider::Claude, &env_in(&dir), NOW, fake_http)
         };
         assert_eq!(attempt(Ok((429, String::new(), Some(120)))), Err(FetchError::RateLimited(Some(120))));
-        assert_eq!(attempt(Ok((503, String::new(), None))), Err(FetchError::Http(503)));
+        assert_eq!(attempt(Ok((503, String::new(), None))), Err(FetchError::RefreshTemporary(503)));
         assert_eq!(attempt(Err("receive timeout".into())), Err(FetchError::Network("receive timeout".into())));
         for body in [
             "", "{}", "[]", r#"{"access_token":"a"}"#,
@@ -908,6 +929,22 @@ mod tests {
             assert_eq!(attempt(Ok((200, body.to_string(), None))), Err(FetchError::Parse), "{body}");
         }
         assert_eq!(stored(&dir), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn temporary_refresh_errors_do_not_poison_the_same_token() {
+        let dir = workdir("transient-refresh");
+        let before = credentials("refresh-transient", NOW - 60);
+        store(&dir, &before);
+        for (status, body) in [(403, r#"{"error":"invalid_grant"}"#), (400, "{}"), (401, "not json"), (400, r#"{"error":"temporarily_unavailable"}"#)] {
+            serve(Ok((status, body.into(), None)));
+            assert_eq!(fetch(Provider::Claude, &env_in(&dir), NOW, fake_http), Err(FetchError::RefreshTemporary(status)));
+            assert_eq!(hosts(), [CLAUDE_TOKEN_HOST]);
+            assert_eq!(stored(&dir), before);
+        }
+        serve(Ok((200, RENEWED.into(), None)));
+        assert!(fetch(Provider::Claude, &env_in(&dir), NOW + 300, fake_http).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -7,7 +7,7 @@ use super::{badge, fill_color};
 use crate::panel::Panel;
 
 // Layout in 96-dpi pixels.
-const WIDTH: f32 = 300.0;
+const WIDTH: f32 = 340.0;
 const PAD: f32 = 16.0;
 const TOP: f32 = 14.0;
 const HEADER_H: f32 = 22.0;
@@ -23,10 +23,17 @@ const STATUS_H: f32 = 16.0;
 const SECTION_GAP: f32 = 12.0;
 
 const ROW_H: f32 = LINE_H + BAR_GAP + BAR_H + DETAIL_GAP + DETAIL_H;
-const SECTION_H: f32 = HEADER_H + HEADER_GAP + ROW_H * 2.0 + ROW_GAP + STATUS_GAP + STATUS_H;
+const SECTION_H: f32 = HEADER_H + HEADER_GAP + ROW_H * 2.0 + ROW_GAP + STATUS_GAP + STATUS_H * 4.0;
 const HEIGHT: f32 = TOP * 2.0 + SECTION_H * 2.0 + SECTION_GAP * 2.0 + 1.0;
 
 const WARNING_TEXT: Color = Color::rgb(245, 158, 11);
+
+pub fn update_hit(panel: &Panel, x: i32, y: i32, scale: f32) -> bool {
+    let x = x as f32 / scale;
+    let y = y as f32 / scale;
+    let top = TOP + SECTION_H - STATUS_H;
+    panel[0].update_login && (PAD..WIDTH-PAD).contains(&x) && (top..top+STATUS_H).contains(&y)
+}
 
 /// Window size in physical pixels.
 pub fn size(scale: f32) -> (i32, i32) {
@@ -46,6 +53,7 @@ mod tests {
     fn offline_panel_rendering() {
         let now = 1_790_860_000;
         let cache = [Some(Entry {
+            source: crate::cache::Source::Web,
             usage: Usage {
                 five_hour: Some(Window { used_pct: 23.0, resets_at: Some(now + 15_800) }),
                 seven_day: Some(Window { used_pct: 91.0, resets_at: Some(now + 248_875) }),
@@ -53,10 +61,18 @@ mod tests {
             fetched_at: now - 200,
             announced: [0, 0],
         }); 2];
-        let errors = [None, Some(FetchError::RateLimited(Some(600)))];
-        let panel = panel::build(&cache, &errors, &Context {
+        let errors = [Some(FetchError::WebUnauthorized), Some(FetchError::RateLimited(Some(600)))];
+        let mut panel = panel::build(&cache, &errors, &Context {
             current: Provider::Claude, show_remaining: false, thresholds: Thresholds::default(), now, utc_offset: 8 * 3600,
         });
+        panel[1].retry = "等待至 明天 16:30 · 23 小时 59 分钟".into();
+        panel[0].retry = "已暂停请求，更新登录后恢复".into();
+        for scale in [1.0, 1.75] {
+            let y = ((TOP + SECTION_H - STATUS_H / 2.0) * scale) as i32;
+            assert!(update_hit(&panel, (PAD * scale + 4.0) as i32, y, scale));
+            assert!(!update_hit(&panel, 0, y, scale));
+            assert!(!update_hit(&panel, (PAD * scale + 4.0) as i32, 0, scale));
+        }
         for light in [false, true] {
             for scale in [1.0, 1.75] {
                 let (w, h) = size(scale);
@@ -155,6 +171,14 @@ pub fn paint(surface: &mut Surface, scratch: &mut Surface, panel: &Panel, light:
             y += STATUS_GAP;
             let color = if section.failed { WARNING_TEXT } else { secondary };
             texts.push(Text { face: Face::Small, text: &section.status, y, h: STATUS_H, align: Align::Left, color });
+            y += STATUS_H;
+            texts.push(Text { face: Face::Small, text: &section.provenance, y, h: STATUS_H, align: Align::Left, color: secondary });
+            y += STATUS_H;
+            texts.push(Text { face: Face::Small, text: &section.retry, y, h: STATUS_H, align: Align::Left, color: secondary });
+            y += STATUS_H;
+            if section.update_login {
+                texts.push(Text { face: Face::Small, text: "更新网页登录…  （点击或按 Enter）", y, h: STATUS_H, align: Align::Left, color: Color::rgb(45, 130, 225) });
+            }
             y += STATUS_H;
         }
     }

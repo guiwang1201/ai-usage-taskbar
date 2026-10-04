@@ -178,6 +178,7 @@ pub enum Align {
 /// Draws one vertically centred line of text inside `rect` onto `target`.
 /// `scratch` must be the same size as `target`.
 pub fn draw_text(target: &mut Surface, scratch: &mut Surface, font: &Font, text: &str, rect: RECT, align: Align, color: Color) {
+    if text.is_empty() { return; }
     let text: Vec<u16> = text.encode_utf16().collect();
     let mut rect = rect;
     let align = match align {

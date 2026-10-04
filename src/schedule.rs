@@ -8,8 +8,7 @@ use crate::model::FetchError;
 pub const MIN_GAP_SECS: i64 = 120;
 /// How often the reading is refreshed while nobody is at the machine.
 pub const IDLE_POLL_SECS: i64 = 900;
-/// Longer than the poll interval, the backoff and a Retry-After can ever add up to.
-/// A scheduled time further away than this means the clock was set back.
+/// Bounds ordinary poll scheduling after a clock change, never a server cooldown.
 pub const MAX_WAIT_SECS: i64 = 2 * 3600;
 
 /// Persisted per-provider request gate, shared by the UI and diagnostic mode.
@@ -52,10 +51,10 @@ impl State {
             self.next_poll = self.blocked_until;
             return;
         }
-        let minimum = if matches!(error, FetchError::RateLimited(_) | FetchError::Unauthorized) { 300 } else { 30 };
+        let minimum = if matches!(error, FetchError::RateLimited(_) | FetchError::Unauthorized | FetchError::RefreshTemporary(_) | FetchError::WebUnauthorized | FetchError::WebForbidden | FetchError::WebCredentials | FetchError::WebOrganization) { 300 } else { 30 };
         self.backoff = self.backoff.saturating_mul(2).clamp(minimum, 960);
         let retry_after = match error {
-            FetchError::RateLimited(Some(seconds)) => i64::from(*seconds).min(3600),
+            FetchError::RateLimited(Some(seconds)) => i64::from(*seconds),
             _ => 0,
         };
         self.last_attempt = now;
@@ -73,8 +72,8 @@ pub fn gap_elapsed(last_response: i64, now: i64) -> bool {
 /// True while a wait the service imposed (rate limit, rejected token) is still running.
 /// Nothing may ask during it: not the schedule, not a wake from sleep, not the user.
 pub fn told_to_wait(blocked_until: i64, now: i64) -> bool {
-    // A wait longer than we ever impose means the clock was set back; ignore it.
-    blocked_until > now && blocked_until.saturating_sub(now) <= MAX_WAIT_SECS
+    // A server-imposed wait is authoritative, including across restarts and clock changes.
+    blocked_until > now
 }
 
 /// Whether the regular schedule should send a request now.
@@ -134,6 +133,19 @@ mod tests {
     }
 
     #[test]
+    fn server_waits_are_not_capped_or_bypassed_by_clock_changes() {
+        let mut state = State::default();
+        state.failed(&FetchError::RateLimited(Some(86_400)), NOW);
+        assert_eq!(state.blocked_until, NOW + 86_400);
+        state.next_poll = 0;
+        assert!(!state.due(None, false, NOW + 7201));
+        assert!(!state.can_request(NOW - 3600));
+        assert!(state.can_request(NOW + 86_400));
+        state.failed(&FetchError::RefreshTemporary(403), NOW);
+        assert!(!state.can_request(NOW + 299));
+    }
+
+    #[test]
     fn polls_when_the_scheduled_time_has_come() {
         assert!(!poll_due(NOW + 60, NOW - 120, Some(NOW - 120), false, NOW));
         assert!(poll_due(NOW, NOW - 180, Some(NOW - 180), false, NOW));
@@ -165,7 +177,7 @@ mod tests {
         assert!(told_to_wait(NOW + 1, NOW));
         assert!(!told_to_wait(NOW, NOW));
         assert!(!told_to_wait(0, NOW), "nothing imposed");
-        assert!(!told_to_wait(NOW + MAX_WAIT_SECS + 1, NOW), "clock was set back");
+        assert!(told_to_wait(NOW + MAX_WAIT_SECS + 1, NOW), "long server waits are preserved");
     }
 
     #[test]

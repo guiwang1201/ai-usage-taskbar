@@ -26,6 +26,9 @@ pub struct Section {
     pub rows: [Row; 2],
     /// How fresh the numbers are, or what went wrong.
     pub status: String,
+    pub provenance: String,
+    pub retry: String,
+    pub update_login: bool,
     pub failed: bool,
 }
 
@@ -65,6 +68,9 @@ fn section(provider: Provider, entry: Option<&Entry>, error: Option<&FetchError>
         current: provider == ctx.current,
         rows: [row("5 小时", usage.five_hour, error.is_some(), ctx), row("7 天", usage.seven_day, error.is_some(), ctx)],
         status,
+        provenance: entry.map_or_else(|| "尚无成功记录".into(), |e| format!("{} · 上次成功 {}", e.source.label(), clock(e.fetched_at, ctx.now, ctx.utc_offset))),
+        retry: String::new(),
+        update_login: provider == Provider::Claude && matches!(error, Some(FetchError::WebUnauthorized | FetchError::WebCredentials | FetchError::WebOrganization)),
         failed: error.is_some(),
     }
 }
@@ -104,6 +110,18 @@ fn row(name: &'static str, window: Option<Window>, failed: bool, ctx: &Context) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_login_keeps_old_quota_and_offers_update_only_for_login_errors() {
+        let panel = build(&[Some(claude()), None], &[Some(FetchError::WebUnauthorized), None], &ctx());
+        assert!(panel[0].update_login);
+        assert!(panel[0].failed);
+        assert_eq!(panel[0].rows[0].value, "已用 23%");
+        for error in [FetchError::WebForbidden, FetchError::RateLimited(Some(300)), FetchError::Network("timeout".into())] {
+            let panel = build(&[Some(claude()), None], &[Some(error), None], &ctx());
+            assert!(!panel[0].update_login);
+        }
+    }
     use crate::model::Usage;
 
     const NOW: i64 = 1_790_860_000; // 21:06 on 1 October 2026 in UTC+8
@@ -120,6 +138,7 @@ mod tests {
 
     fn claude() -> Entry {
         Entry {
+            source: crate::cache::Source::OAuth,
             fetched_at: NOW - 200,
             announced: [0, 0],
             usage: Usage {

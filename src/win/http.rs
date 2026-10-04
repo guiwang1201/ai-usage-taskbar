@@ -49,7 +49,7 @@ pub fn send(request: &Request) -> Result<Response, String> {
     let started = Instant::now();
     let agent = wide(&request.user_agent);
     let host = wide(request.host);
-    let path = wide(request.path);
+    let path = wide(&request.path);
     let verb = wide(if request.body.is_some() { "POST" } else { "GET" });
     let body = request.body.as_deref().unwrap_or_default().as_bytes();
     let body_len = u32::try_from(body.len()).map_err(|_| "Request body too large".to_string())?;
@@ -131,9 +131,11 @@ pub fn send(request: &Request) -> Result<Response, String> {
             retry_after(&String::from_utf16_lossy(&value[..len]), super::unix_now())
         } else { None };
 
-        // Error bodies are not used and can be arbitrarily large or slow. In
-        // particular, act on 429 immediately instead of waiting to read its body.
-        if status != 200 {
+        // Read only bounded refresh 400/401 bodies to identify invalid_grant.
+        // Act on 429 immediately, without waiting for an error body.
+        let refresh_error = request.host == "platform.claude.com"
+            && request.path == "/v1/oauth/token" && matches!(status, 400 | 401);
+        if status != 200 && !refresh_error {
             return Ok(Response { status: status as u16, body: String::new(), retry_after });
         }
 
@@ -150,7 +152,7 @@ pub fn send(request: &Request) -> Result<Response, String> {
             if read == 0 {
                 break;
             }
-            if body.len() + read as usize > MAX_BODY {
+            if body.len() + read as usize > if refresh_error { 16 * 1024 } else { MAX_BODY } {
                 return Err("Response exceeded size limit".into());
             }
             body.extend_from_slice(&chunk[..read as usize]);

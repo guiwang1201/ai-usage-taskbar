@@ -9,6 +9,8 @@ use crate::model::{Provider, Thresholds};
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
+    /// None keeps compatibility with the legacy environment configuration.
+    pub claude_web: Option<bool>,
     /// Which assistant the widget shows.
     pub provider: Provider,
     /// Show what is left instead of what has been used.
@@ -25,6 +27,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            claude_web: None,
             provider: Provider::Claude,
             show_remaining: false,
             offset_x: 0,
@@ -51,6 +54,7 @@ impl Settings {
         // A warning level above the critical one would never be seen.
         let warn = number("warn_pct").map_or(defaults.thresholds.warn, |n| (n as i64).clamp(1, 100)).min(crit);
         Settings {
+            claude_web: match map.get("claude_web") { Some(JsonValue::Boolean(v)) => Some(*v), _ => None },
             provider: match map.get("provider") {
                 Some(JsonValue::String(key)) => Provider::from_key(key).unwrap_or(defaults.provider),
                 _ => defaults.provider,
@@ -68,6 +72,7 @@ impl Settings {
             std::fs::create_dir_all(dir)?;
         }
         let fields = [
+            format!("\"claude_web\": {}", self.claude_web.map_or("null", |v| if v { "true" } else { "false" })),
             format!("\"provider\": \"{}\"", self.provider.key()),
             format!("\"show_remaining\": {}", self.show_remaining),
             format!("\"offset_x\": {}", self.offset_x),
@@ -88,6 +93,7 @@ mod tests {
     fn round_trips() {
         let path = std::env::temp_dir().join(format!("iusage-settings-test-{}.json", std::process::id()));
         let settings = Settings {
+            claude_web: Some(true),
             provider: Provider::Codex,
             show_remaining: true,
             offset_x: 180,

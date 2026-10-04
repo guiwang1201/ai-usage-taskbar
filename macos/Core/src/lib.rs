@@ -178,7 +178,7 @@ pub unsafe extern "C" fn iusage_claude_refresh_finish(
         Ok(Some(updated)) => if copy_out(&updated, out, capacity, out_len) { 0 } else { 8 },
         Err(model::FetchError::Unauthorized) => 2,
         Err(model::FetchError::RateLimited(_)) => 3,
-        Err(model::FetchError::Http(_)) => 4,
+        Err(model::FetchError::Http(_) | model::FetchError::RefreshTemporary(_)) => 4,
         Err(model::FetchError::Parse) => 5,
         Err(model::FetchError::CannotSave) => 6,
         Err(model::FetchError::NoCredentials) => 7,
@@ -287,7 +287,7 @@ mod tests {
     fn ffi_does_not_offer_a_refused_token_again() {
         let before = stored("ffi-refused", (NOW - 60) * 1000);
         assert_eq!(plan(&before).0, 0);
-        assert_eq!(finish(&before, 400, 0, "", "").0, 2);
+        assert_eq!(finish(&before, 400, 0, r#"{"error":"invalid_grant"}"#, "").0, 2);
         assert_eq!(plan(&before).0, 2, "a local verdict now; nothing would be sent");
         assert_eq!(plan(&stored("ffi-refused-after-login", (NOW - 60) * 1000)).0, 0);
     }

@@ -10,8 +10,21 @@ use crate::json::{self, get, num};
 use crate::model::{Provider, Usage, Window};
 use crate::schedule::State;
 
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum Source { #[default] Unknown, OAuth, Web, Codex }
+
+impl Source {
+    pub fn key(self) -> &'static str {
+        match self { Self::Unknown => "unknown", Self::OAuth => "oauth", Self::Web => "web", Self::Codex => "codex" }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Unknown => "旧缓存", Self::OAuth => "Claude Code", Self::Web => "Claude 网页", Self::Codex => "Codex" }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Entry {
+    pub source: Source,
     pub usage: Usage,
     /// Unix seconds of the fetch that produced `usage`.
     pub fetched_at: i64,
@@ -22,9 +35,18 @@ pub struct Entry {
 /// Indexed by `Provider::index`.
 pub type Cache = [Option<Entry>; 2];
 
+/// Returns true only on the first confirmed authentication failure in an episode.
+pub fn mark_web_expired(expired: &mut bool, error: &crate::model::FetchError) -> bool {
+    if matches!(error, crate::model::FetchError::WebUnauthorized) && !*expired {
+        *expired = true;
+        true
+    } else { false }
+}
+
 /// Everything kept across restarts.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Stored {
+    pub web_expired: bool,
     pub cache: Cache,
     pub schedule: [State; 2],
 }
@@ -34,6 +56,7 @@ pub fn load(path: &Path) -> Stored {
     let mut stored = Stored::default();
     let Ok(text) = std::fs::read_to_string(path) else { return stored };
     let Some(root) = json::parse(&text) else { return stored };
+    stored.web_expired = matches!(get(&root, "web_expired"), Some(JsonValue::Boolean(true)));
     for provider in Provider::ALL {
         stored.cache[provider.index()] = get(&root, provider.key()).and_then(entry);
         stored.schedule[provider.index()].last_attempt = stored.cache[provider.index()].map_or(0, |e| e.fetched_at);
@@ -65,7 +88,8 @@ pub fn save(path: &Path, stored: &Stored) -> std::io::Result<()> {
         .map(|provider| {
             let value = match &cache[provider.index()] {
                 Some(e) => format!(
-                    "{{\"fetched_at\":{},\"five_hour\":{},\"seven_day\":{},\"announced\":[{},{}]}}",
+                    "{{\"source\":\"{}\",\"fetched_at\":{},\"five_hour\":{},\"seven_day\":{},\"announced\":[{},{}]}}",
+                    e.source.key(),
                     e.fetched_at,
                     window_json(e.usage.five_hour),
                     window_json(e.usage.seven_day),
@@ -78,6 +102,7 @@ pub fn save(path: &Path, stored: &Stored) -> std::io::Result<()> {
         })
         .collect();
     // Keep the old cooldown field readable by an older executable as well.
+    entries.push(format!("\"web_expired\":{}", stored.web_expired));
     entries.push(format!("\"blocked_until\":[{},{}]", stored.schedule[0].blocked_until, stored.schedule[1].blocked_until));
     let states = stored.schedule.map(|s| format!(
         "{{\"last_attempt\":{},\"next_poll\":{},\"blocked_until\":{},\"backoff\":{}}}",
@@ -105,6 +130,9 @@ fn entry(value: &JsonValue) -> Option<Entry> {
         }
     }
     Some(Entry {
+        source: match get(value, "source").and_then(json::text) {
+            Some("oauth") => Source::OAuth, Some("web") => Source::Web, Some("codex") => Source::Codex, _ => Source::Unknown,
+        },
         announced,
         fetched_at: timestamp(get(value, "fetched_at")?)?,
         usage: Usage {
@@ -131,11 +159,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn login_expiry_is_distinct_from_access_blocks_and_rate_limits() {
+        use crate::model::FetchError;
+        let mut expired = false;
+        for error in [FetchError::WebForbidden, FetchError::RateLimited(Some(600)), FetchError::Network("timeout".into()), FetchError::WebOrganization] {
+            assert!(!mark_web_expired(&mut expired, &error));
+            assert!(!expired);
+        }
+        assert!(mark_web_expired(&mut expired, &FetchError::WebUnauthorized));
+        assert!(!mark_web_expired(&mut expired, &FetchError::WebUnauthorized));
+        let path = std::env::temp_dir().join(format!("iusage-expired-{}.json", std::process::id()));
+        let mut stored = Stored { web_expired: expired, ..Stored::default() };
+        stored.schedule[0].failed(&FetchError::WebUnauthorized, 1000);
+        save(&path, &stored).unwrap();
+        let mut restored = load(&path);
+        assert!(!mark_web_expired(&mut restored.web_expired, &FetchError::WebUnauthorized));
+        restored.web_expired = false; // A user update allows a new episode, not a cooldown bypass.
+        assert!(!restored.schedule[0].can_request(1100));
+        assert!(mark_web_expired(&mut restored.web_expired, &FetchError::WebUnauthorized));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn round_trips() {
         let path = std::env::temp_dir().join(format!("iusage-cache-test-{}.json", std::process::id()));
         let stored = Stored {
+            web_expired: true,
             cache: [
                 Some(Entry {
+                    source: Source::Web,
                     fetched_at: 1_790_000_000,
                     announced: [1, 2],
                     usage: Usage {
@@ -151,12 +203,25 @@ mod tests {
         assert_eq!(load(&path), stored);
 
         let other = Stored {
-            cache: [None, Some(Entry { fetched_at: 5, announced: [0, 0], usage: Usage::default() })],
+            web_expired: false,
+            cache: [None, Some(Entry { source: Source::Unknown, fetched_at: 5, announced: [0, 0], usage: Usage::default() })],
             schedule: [State::default(), State { blocked_until: 77, ..State::default() }],
         };
         save(&path, &other).unwrap();
         assert_eq!(load(&path), other);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn long_server_cooldown_survives_restart_without_a_reading() {
+        let path = std::env::temp_dir().join(format!("iusage-long-wait-{}.json", std::process::id()));
+        let mut stored = Stored::default();
+        stored.schedule[0].failed(&crate::model::FetchError::RateLimited(Some(86_400)), 1_790_000_000);
+        save(&path, &stored).unwrap();
+        let restored = load(&path);
+        assert!(!restored.schedule[0].can_request(1_790_080_000));
+        assert_eq!(restored, stored);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
