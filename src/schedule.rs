@@ -95,6 +95,19 @@ mod tests {
     const NOW: i64 = 1_000_000;
 
     #[test]
+    fn two_minute_poll_preserves_idle_and_server_waits() {
+        let mut state = State::default();
+        state.succeeded(NOW, 120);
+        assert!(!state.due(Some(NOW), false, NOW + 119));
+        assert!(state.due(Some(NOW), false, NOW + 120));
+        assert!(!state.due(Some(NOW), true, NOW + 120));
+        assert!(state.due(Some(NOW), true, NOW + IDLE_POLL_SECS));
+        state.failed(&FetchError::RateLimited(Some(1800)), NOW + 120);
+        assert!(!state.due(Some(NOW), false, NOW + 1919));
+        assert!(state.due(Some(NOW), false, NOW + 1920));
+    }
+
+    #[test]
     fn repeated_limits_really_double_and_survive_a_copy() {
         let mut state = State::default();
         for delay in [300, 600, 960, 960] {

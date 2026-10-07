@@ -61,8 +61,6 @@ const CMD_REFRESH: u32 = 5;
 const CMD_AUTOSTART: u32 = 6;
 const CMD_NOTIFY: u32 = 7;
 const CMD_EXIT: u32 = 9;
-const CMD_SOURCE_CODE: u32 = 10;
-const CMD_SOURCE_WEB: u32 = 11;
 const CMD_WEB_CONFIG: u32 = 12;
 
 /// With no keyboard or mouse input for this long, nobody is looking at the widget.
@@ -539,14 +537,7 @@ unsafe fn menu(owner: HWND) {
     };
     item(CMD_CLAUDE, "Claude");
     item(CMD_CODEX, "Codex");
-    if web && expired { item(CMD_WEB_CONFIG, "Claude 登录已失效：更新登录…"); }
-    let sources = CreatePopupMenu();
-    AppendMenuW(sources, MF_STRING, CMD_SOURCE_CODE as usize, wide("Claude Code 登录").as_ptr());
-    AppendMenuW(sources, MF_STRING, CMD_SOURCE_WEB as usize, wide("Claude 网页登录").as_ptr());
-    AppendMenuW(sources, MF_SEPARATOR, 0, null());
-    AppendMenuW(sources, MF_STRING, CMD_WEB_CONFIG as usize, wide("配置 / 更新网页登录…").as_ptr());
-    CheckMenuRadioItem(sources, CMD_SOURCE_CODE, CMD_SOURCE_WEB, if web {CMD_SOURCE_WEB} else {CMD_SOURCE_CODE}, MF_BYCOMMAND);
-    AppendMenuW(menu, MF_POPUP, sources as usize, wide("Claude 数据来源").as_ptr());
+    item(CMD_WEB_CONFIG, if web && expired { "Claude 登录已失效：更新…" } else { "Claude 登录设置…" });
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     item(CMD_USED, "显示已用");
     item(CMD_REMAINING, "显示剩余");
@@ -900,6 +891,8 @@ impl App {
     /// Repaints the widget, the tray icon and the detail panel if what they show has changed.
     unsafe fn refresh(&mut self) {
         self.refresh_popup();
+        let now = unix_now();
+        let utc_offset = utc_offset_secs();
         let provider = self.settings.provider;
         let i = provider.index();
         let mut view = view::build(
@@ -908,20 +901,22 @@ impl App {
             self.error[i].as_ref(),
             self.settings.show_remaining,
             self.settings.thresholds,
-            unix_now(),
+            now,
         );
         if let Some(entry) = self.cache[i] {
-            view.tip.push_str(&format!("\n{} · 上次成功 {}", entry.source.label(), crate::timefmt::clock(entry.fetched_at, unix_now(), utc_offset_secs())));
+            view.tip.push_str(&format!("\n{} · 上次成功 {}", entry.source.label(), crate::timefmt::clock(entry.fetched_at, now, utc_offset)));
         }
-        if schedule::told_to_wait(self.schedule[i].blocked_until, unix_now()) {
-            view.tip.push_str(&format!("\n等待至 {}", crate::timefmt::clock(self.schedule[i].blocked_until, unix_now(), utc_offset_secs())));
+        if schedule::told_to_wait(self.schedule[i].blocked_until, now) {
+            view.tip.push_str(&format!("\n等待至 {}", crate::timefmt::clock(self.schedule[i].blocked_until, now, utc_offset)));
             view.stale |= self.cache[i].is_some() && self.schedule[i].backoff > 0;
         }
         let shown = Shown { view, light: self.light };
         if self.shown.as_ref() == Some(&shown) {
             return;
         }
-        self.paint(&shown);
+        if !self.shown.as_ref().is_some_and(|old| old.light == shown.light && old.view.same_pixels(&shown.view)) {
+            self.paint(&shown);
+        }
         // Countdown/tooltip text changes do not change the icon's pixels.
         let same_icon = self.shown.as_ref().is_some_and(|old| {
             old.light == shown.light && old.view.stale == shown.view.stale
@@ -1161,11 +1156,6 @@ impl App {
 
     unsafe fn on_command(&mut self, command: u32) {
         match command {
-            CMD_SOURCE_CODE => self.set_claude_source(false),
-            CMD_SOURCE_WEB => {
-                if web_login::load().is_ok() { self.set_claude_source(true); }
-                else { self.open_web_config(); }
-            }
             CMD_WEB_CONFIG => self.open_web_config(),
             CMD_CLAUDE => self.set_provider(Provider::Claude),
             CMD_CODEX => self.set_provider(Provider::Codex),

@@ -2,6 +2,19 @@
 
 use tinyjson::JsonValue;
 
+/// Settings/cache are normally under a kilobyte. Bound reads even if a file grows
+/// while open, so an accidentally replaced file cannot consume arbitrary memory.
+pub fn read_small_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::{Read, Error, ErrorKind};
+    const LIMIT: u64 = 1024 * 1024;
+    let mut text = String::new();
+    std::fs::File::open(path)?.take(LIMIT + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > LIMIT {
+        return Err(Error::new(ErrorKind::InvalidData, "Local JSON file exceeds size limit"));
+    }
+    Ok(text)
+}
+
 /// Replace a complete file so a crash cannot leave a truncated settings/cache file.
 pub fn write_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
@@ -98,6 +111,18 @@ pub fn text(value: &JsonValue) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_file_reads_are_bounded() {
+        let path = std::env::temp_dir().join(format!("iusage-bounded-{}.json", std::process::id()));
+        std::fs::write(&path, b"{}").unwrap();
+        assert_eq!(read_small_file(&path).unwrap(), "{}");
+        std::fs::write(&path, vec![b' '; 1024 * 1024]).unwrap();
+        assert_eq!(read_small_file(&path).unwrap().len(), 1024 * 1024);
+        std::fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert_eq!(read_small_file(&path).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn parses_ordinary_json_with_or_without_a_bom() {

@@ -5,3 +5,17 @@
 # Feasibility-phase scripts, prototype and notes. They describe one machine and one
 # account, and are kept locally only.
 /phase0/
+
+# Personal agent instructions and local runtime data (never release these).
+/AGENTS.md
+.env
+.env.*
+!.env.example
+**/.credentials.json
+**/auth.json
+**/claude-web.dpapi
+/settings.json
+/cache.json
+/last-error.txt
+/backups/
+*.log

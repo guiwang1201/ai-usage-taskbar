@@ -31,9 +31,8 @@ impl Default for Settings {
             provider: Provider::Claude,
             show_remaining: false,
             offset_x: 0,
-            // Each provider's usage endpoint is rate limited; two minutes ran into the
-            // limit as soon as anything else asked as well.
-            poll_secs: 180,
+            // Keep the existing per-provider request floor and server cooldowns.
+            poll_secs: crate::schedule::MIN_GAP_SECS as u32,
             notify: true,
             thresholds: Thresholds::default(),
         }
@@ -44,7 +43,7 @@ impl Settings {
     /// Missing or malformed files and fields fall back to defaults.
     pub fn load(path: &Path) -> Settings {
         let defaults = Settings::default();
-        let Ok(text) = std::fs::read_to_string(path) else { return defaults };
+        let Ok(text) = json::read_small_file(path) else { return defaults };
         let Some(JsonValue::Object(map)) = json::parse(&text) else { return defaults };
         let number = |key: &str| match map.get(key) {
             Some(JsonValue::Number(n)) => Some(*n),
@@ -61,7 +60,7 @@ impl Settings {
             },
             show_remaining: matches!(map.get("show_remaining"), Some(JsonValue::Boolean(true))),
             offset_x: number("offset_x").map_or(defaults.offset_x, |n| (n as i32).max(0)),
-            poll_secs: number("poll_secs").map_or(defaults.poll_secs, |n| (n as u32).clamp(30, 3600)),
+            poll_secs: number("poll_secs").map_or(defaults.poll_secs, |n| (n as u32).clamp(crate::schedule::MIN_GAP_SECS as u32, 3600)),
             notify: !matches!(map.get("notify"), Some(JsonValue::Boolean(false))),
             thresholds: Thresholds { warn, crit },
         }
@@ -123,7 +122,7 @@ mod tests {
         std::fs::write(&path, r#"{"provider":"gemini","poll_secs":1,"offset_x":-40,"warn_pct":95,"crit_pct":80}"#).unwrap();
         let loaded = Settings::load(&path);
         assert_eq!(loaded.provider, Provider::Claude);
-        assert_eq!(loaded.poll_secs, 30);
+        assert_eq!(loaded.poll_secs, 120);
         assert_eq!(loaded.offset_x, 0);
         assert!(loaded.notify, "a file written before the option existed keeps notifications on");
         assert_eq!(loaded.thresholds, Thresholds { warn: 80, crit: 80 });

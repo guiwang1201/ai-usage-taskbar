@@ -17,6 +17,7 @@ const CLEAR: i32 = 108;
 const CANCEL: i32 = 109;
 const NOTE: i32 = 110;
 const ORG_LABEL: i32 = 111;
+const USE_CODE: i32 = 112;
 
 fn path() -> PathBuf { app_data_dir().join("IUsage").join("claude-web.dpapi") }
 
@@ -94,7 +95,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let font = CreateFontW(-((GetDpiForWindow(hwnd) * 14 / 96) as i32), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 4, 0, wide("Segoe UI").as_ptr());
             (*state).font = font;
             let fields = [
-                control(hwnd,"STATIC","使用你在 claude.ai 的登录信息读取额度。",0,20,16,460,24,0),
+                control(hwnd,"STATIC","网页登录：无需安装 Claude Code。",0,20,16,460,24,0),
                 control(hwnd,"STATIC","登录信息（sessionKey）",0,20,48,460,22,0),
                 control(hwnd,"EDIT","",KEY,20,74,460,28,WS_BORDER | WS_TABSTOP | ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32),
                 control(hwnd,"BUTTON","显示登录信息",SHOW,20,110,160,24,WS_TABSTOP | BS_AUTOCHECKBOX as u32),
@@ -107,12 +108,13 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 control(hwnd,"BUTTON","清除登录信息",CLEAR,20,325,130,32,WS_TABSTOP),
                 control(hwnd,"BUTTON","取消",CANCEL,260,325,90,32,WS_TABSTOP),
                 control(hwnd,"BUTTON","保存并使用",SAVE,360,325,120,32,WS_TABSTOP | BS_DEFPUSHBUTTON as u32),
+                control(hwnd,"BUTTON","改用本机 Claude Code 登录",USE_CODE,20,370,460,32,WS_TABSTOP),
             ];
             for field in fields { SendMessageW(field, WM_SETFONT, font as usize, 1); }
             SendMessageW(GetDlgItem(hwnd,KEY), EM_SETLIMITTEXT, 8220, 0);
             SendMessageW(GetDlgItem(hwnd,ORG), EM_SETLIMITTEXT, 128, 0);
             ShowWindow(GetDlgItem(hwnd,ORG),SW_HIDE); ShowWindow(GetDlgItem(hwnd,ORG_LABEL),SW_HIDE);
-            note(hwnd, "登录信息将由 Windows 加密，仅供当前用户读取。\r\n保存只检查格式，不会额外请求额度。");
+            note(hwnd, "sessionKey 是敏感登录凭据，请勿分享。\r\n本机加密保存，仅发送至 claude.ai，不上传给开发者。\r\n保存只检查格式；组织 ID 通常自动获取。");
             if (*state).expired {
                 note(hwnd, "网页登录已失效。请在网页重新登录后，复制新的 sessionKey。\r\n原组织 ID 已保留；取消不会改动已保存的信息。");
                 SetWindowTextW(GetDlgItem(hwnd,SAVE),wide("更新并使用").as_ptr());
@@ -151,6 +153,10 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         }
                     }
                 }
+                USE_CODE => {
+                    PostMessageW((*state).owner as HWND,WM_APP_WEB_LOGIN,2,0);
+                    DestroyWindow(hwnd);
+                }
                 CLEAR => {
                     if MessageBoxW(hwnd,wide("清除本机保存的网页登录信息，并切换回 Claude Code 登录？").as_ptr(),wide("清除网页登录信息").as_ptr(),MB_YESNO | MB_ICONQUESTION)==IDYES {
                         match std::fs::remove_file(path()) {
@@ -180,8 +186,8 @@ pub fn open(owner: HWND, waiting: String, expired: bool) {
         RegisterClassW(&wc);
         let mut state=Dialog{owner,waiting,font:null_mut(),load_saved:true,expired};
         let scale=windows_sys::Win32::UI::HiDpi::GetDpiForSystem() as f32/96.0;
-        let hwnd=CreateWindowExW(WS_EX_APPWINDOW | WS_EX_CONTROLPARENT,class.as_ptr(),wide("Claude 网页登录 · IUsage").as_ptr(),WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-            CW_USEDEFAULT,CW_USEDEFAULT,(520.0*scale) as i32,(410.0*scale) as i32,null_mut(),null_mut(),wc.hInstance,&mut state as *mut _ as *const c_void);
+        let hwnd=CreateWindowExW(WS_EX_APPWINDOW | WS_EX_CONTROLPARENT,class.as_ptr(),wide("Claude 登录设置 · IUsage").as_ptr(),WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT,CW_USEDEFAULT,(520.0*scale) as i32,(455.0*scale) as i32,null_mut(),null_mut(),wc.hInstance,&mut state as *mut _ as *const c_void);
         if !hwnd.is_null() {
             ShowWindow(hwnd,SW_SHOW); SetForegroundWindow(hwnd);
             let mut msg: MSG=std::mem::zeroed();
@@ -208,7 +214,7 @@ mod tests {
             let mut state=Dialog{owner:0,waiting:String::new(),font:null_mut(),load_saved:false,expired:true};
             let scale=windows_sys::Win32::UI::HiDpi::GetDpiForSystem() as f32/96.0;
             let hwnd=CreateWindowExW(0,class.as_ptr(),wide("Claude 网页登录").as_ptr(),WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                0,0,(520.0*scale) as i32,(410.0*scale) as i32,null_mut(),null_mut(),wc.hInstance,&mut state as *mut _ as *const c_void);
+                0,0,(520.0*scale) as i32,(455.0*scale) as i32,null_mut(),null_mut(),wc.hInstance,&mut state as *mut _ as *const c_void);
             assert!(!hwnd.is_null());
             assert_ne!(GetWindowLongW(GetDlgItem(hwnd,KEY),GWL_STYLE) as u32 & ES_PASSWORD as u32,0);
             assert_eq!(GetWindowLongW(GetDlgItem(hwnd,ORG),GWL_STYLE) as u32 & WS_VISIBLE,0);
@@ -218,7 +224,7 @@ mod tests {
             SetWindowTextW(GetDlgItem(hwnd,KEY),wide("demo-session-secret").as_ptr());
             assert_eq!(value(hwnd,KEY),"demo-session-secret");
             let mut bounds: RECT=std::mem::zeroed(); GetClientRect(hwnd,&mut bounds);
-            let mut button: RECT=std::mem::zeroed(); GetWindowRect(GetDlgItem(hwnd,SAVE),&mut button);
+            let mut button: RECT=std::mem::zeroed(); GetWindowRect(GetDlgItem(hwnd,USE_CODE),&mut button);
             let mut corner=POINT{x:button.right,y:button.bottom}; ScreenToClient(hwnd,&mut corner);
             assert!(corner.y<=bounds.bottom && corner.x<=bounds.right);
             if let Some(dir)=std::env::var_os("IUSAGE_TEST_RENDER_DIR") {

@@ -40,6 +40,13 @@ pub struct View {
     pub tip: String,
 }
 
+impl View {
+    /// Tooltip updates do not change the taskbar bitmap.
+    pub fn same_pixels(&self, other: &Self) -> bool {
+        self.provider == other.provider && self.rows == other.rows && self.stale == other.stale
+    }
+}
+
 pub fn build(
     provider: Provider,
     usage: Option<&Usage>,
@@ -281,5 +288,21 @@ mod tests {
         let view = build(Provider::Codex, None, None, false, T, NOW);
         assert_eq!(view.rows[0].text, "…");
         assert_eq!(view.tip, "IUsage · Codex");
+    }
+
+    #[test]
+    fn repaint_depends_on_pixels_not_tooltip() {
+        let original = build(Provider::Codex, Some(&usage()), None, false, T, NOW);
+        let mut changed = original.clone();
+        changed.tip.push_str(" updated timestamp");
+        assert!(original.same_pixels(&changed));
+        changed.rows[0].text.push('!');
+        assert!(!original.same_pixels(&changed));
+        changed = original.clone();
+        changed.stale = true;
+        assert!(!original.same_pixels(&changed));
+        changed = original.clone();
+        changed.provider = Provider::Claude;
+        assert!(!original.same_pixels(&changed));
     }
 }

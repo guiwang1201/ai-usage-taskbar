@@ -54,7 +54,7 @@ pub struct Stored {
 /// A missing or malformed file is an empty cache.
 pub fn load(path: &Path) -> Stored {
     let mut stored = Stored::default();
-    let Ok(text) = std::fs::read_to_string(path) else { return stored };
+    let Ok(text) = json::read_small_file(path) else { return stored };
     let Some(root) = json::parse(&text) else { return stored };
     stored.web_expired = matches!(get(&root, "web_expired"), Some(JsonValue::Boolean(true)));
     for provider in Provider::ALL {
