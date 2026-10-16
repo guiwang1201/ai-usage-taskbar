@@ -42,8 +42,8 @@ use crate::panel::{self, Panel};
 use crate::providers::{self, Env};
 use crate::schedule;
 use crate::settings::Settings;
-use crate::view::{self, Row, Severity, View};
-use render::{draw_text, Align, Canvas, Color, Font, Surface};
+use crate::view::{self, Severity, View};
+use render::{draw_text, Align, Color, Font, Surface};
 
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_FETCHED: u32 = WM_APP + 2;
@@ -611,42 +611,12 @@ fn theme_colors(light: bool) -> (Color, Color) {
     }
 }
 
-/// Two bars filling a small square, for the tray.
-unsafe fn make_icon(rows: &[Row; 2], light: bool, stale: bool) -> HICON {
+/// The application icon embedded by `build.rs` (icon group 1), at the tray's size.
+/// Usage is shown by the widget and tooltip, so the tray icon never changes.
+unsafe fn load_app_icon() -> HICON {
     let n = GetSystemMetrics(SM_CXSMICON).max(16);
-    let size = n as f32;
-    let mut px = vec![0u32; (n * n) as usize];
-    {
-        let mut canvas = Canvas { px: &mut px, w: n, h: n };
-        let bar_h = (size * 0.30).round();
-        let gap = (size * 0.16).round();
-        let top = ((size - bar_h * 2.0 - gap) / 2.0).floor();
-        let track = if light { Color::rgba(0, 0, 0, 80) } else { Color::rgba(255, 255, 255, 90) };
-        for (i, row) in rows.iter().enumerate() {
-            let y = top + i as f32 * (bar_h + gap);
-            canvas.round_rect(0.0, y, size, bar_h, size * 0.08, f32::MAX, track);
-            if let Some(fill) = row.fill.filter(|f| *f > 0.0) {
-                let color = fill_color(row.severity).faded(if stale { STALE_FADE } else { 1.0 });
-                canvas.round_rect(0.0, y, size, bar_h, size * 0.08, size * fill, color);
-            }
-        }
-    }
-    // Icon bitmaps carry straight alpha, the canvas is premultiplied.
-    for p in px.iter_mut() {
-        let a = *p >> 24;
-        if a != 0 && a != 255 {
-            let straight = |shift: u32| (((*p >> shift) & 0xFF) * 255 / a).min(255) << shift;
-            *p = (a << 24) | straight(16) | straight(8) | straight(0);
-        }
-    }
-    let mask = vec![0u8; (((n + 15) / 16) * 2 * n) as usize];
-    let color = CreateBitmap(n, n, 1, 32, px.as_ptr() as *const c_void);
-    let mask = CreateBitmap(n, n, 1, 1, mask.as_ptr() as *const c_void);
-    let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
-    let icon = CreateIconIndirect(&info);
-    DeleteObject(color);
-    DeleteObject(mask);
-    icon
+    // MAKEINTRESOURCE(1): the resource id travels in the pointer value.
+    LoadImageW(GetModuleHandleW(null()), 1 as *const u16, IMAGE_ICON, n, n, LR_DEFAULTCOLOR) as HICON
 }
 
 impl App {
@@ -917,21 +887,8 @@ impl App {
         if !self.shown.as_ref().is_some_and(|old| old.light == shown.light && old.view.same_pixels(&shown.view)) {
             self.paint(&shown);
         }
-        // Countdown/tooltip text changes do not change the icon's pixels.
-        let same_icon = self.shown.as_ref().is_some_and(|old| {
-            old.light == shown.light && old.view.stale == shown.view.stale
-                && old.view.rows.iter().zip(&shown.view.rows).all(|(a, b)| a.fill == b.fill && a.severity == b.severity)
-        });
-        let old_icon = self.icon;
-        if !same_icon || self.icon.is_null() {
-            let icon = make_icon(&shown.view.rows, shown.light, shown.view.stale);
-            if !icon.is_null() { self.icon = icon; }
-        }
         self.shown = Some(shown);
         self.set_tray(NIM_MODIFY);
-        if !old_icon.is_null() && old_icon != self.icon {
-            DestroyIcon(old_icon);
-        }
     }
 
     unsafe fn paint(&mut self, shown: &Shown) {
@@ -1010,8 +967,7 @@ impl App {
 
     unsafe fn set_tray(&mut self, message: NOTIFY_ICON_MESSAGE) {
         if self.icon.is_null() {
-            let blank = view::build(self.settings.provider, None, None, false, self.settings.thresholds, 0);
-            self.icon = make_icon(&blank.rows, self.light, false);
+            self.icon = load_app_icon();
         }
         let mut data = self.tray_data();
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
