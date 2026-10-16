@@ -220,9 +220,9 @@ mod tests {
         let mut gate = MacGate::default();
         unsafe {
             assert!(iusage_start(&mut gate, 1000));
-            assert!(!iusage_start(&mut gate, 1119));
+            assert!(!iusage_start(&mut gate, 1089));
             assert_eq!(gate.last_attempt, 1000);
-            assert!(iusage_can_request(&gate, 1120));
+            assert!(iusage_can_request(&gate, 1090));
         }
     }
 

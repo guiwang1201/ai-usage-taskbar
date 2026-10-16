@@ -100,10 +100,10 @@ final class OfflineRuntime {
         return lines
     }
     func nextEvent(provider: Int, now: Int64, idle: Bool) -> Int64 {
-        if inFlight.contains(provider) { return now + 120 }
+        if inFlight.contains(provider) { return now + 90 }
         let gate = state.gates[provider]
         let idleUntil = idle ? (state.readings[provider]?.fetchedAt ?? 0) + 900 : 0
-        return max(now, gate.nextPoll, gate.blockedUntil, gate.lastAttempt + 120, idleUntil)
+        return max(now, gate.nextPoll, gate.blockedUntil, gate.lastAttempt + 90, idleUntil)
     }
     // Mock response only; production networking must use a separate explicit adapter.
     @discardableResult
@@ -137,7 +137,7 @@ final class OfflineRuntime {
         guard inFlight.remove(provider) != nil else { return }
         localIssues[provider] = nil
         var gate = state.gates[provider].native
-        _ = iusage_complete(&gate, now, status, retryAfter, 120)
+        _ = iusage_complete(&gate, now, status, retryAfter, 90)
         state.gates[provider] = SavedGate(gate)
         errors[provider] = status == 200 ? nil : label
         try save(state)
