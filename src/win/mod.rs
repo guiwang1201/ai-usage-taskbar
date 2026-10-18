@@ -272,7 +272,7 @@ pub fn check() {
                 stored.schedule[i].succeeded(now, settings.poll_secs);
                 let mut announced = stored.cache[i].map_or([0, 0], |e| e.announced);
                 if let Some(previous) = stored.cache[i] {
-                    alert::rearm(&mut announced, &previous.usage, &usage);
+                    alert::rearm(&mut announced, &previous.usage, &usage, now);
                 }
                 stored.cache[i] = Some(Entry { usage, source, fetched_at: now, announced });
                 let v = view::build(provider, Some(&usage), None, false, Thresholds::default(), now);
@@ -1067,10 +1067,10 @@ impl App {
                 if self.settings.notify {
                     announced = self.cache[i].map_or(announced, |entry| entry.announced);
                     if let Some(previous) = self.cache[i] {
-                        alert::rearm(&mut announced, &previous.usage, &usage);
+                        alert::rearm(&mut announced, &previous.usage, &usage, now);
                     }
                     if provider == self.settings.provider {
-                        alert = alert::check(&mut announced, &usage, self.settings.thresholds, now);
+                        alert = alert::check(&mut announced, &usage, now);
                     }
                 }
                 self.cache[i] = Some(Entry { usage, source, fetched_at: now, announced });

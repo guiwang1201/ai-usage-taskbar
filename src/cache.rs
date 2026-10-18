@@ -126,7 +126,7 @@ fn entry(value: &JsonValue) -> Option<Entry> {
     let mut announced: Announced = [0, 0];
     if let Some(JsonValue::Array(levels)) = get(value, "announced") {
         for (slot, level) in announced.iter_mut().zip(levels) {
-            *slot = num(level).map_or(0, |n| n.clamp(0.0, 2.0) as u8);
+            *slot = num(level).map_or(0, |n| n.clamp(0.0, 3.0) as u8);
         }
     }
     Some(Entry {

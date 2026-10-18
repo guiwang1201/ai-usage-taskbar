@@ -76,7 +76,7 @@ let high = SavedReading(five: 80, seven: 10, fetchedAt: 1000, fiveReset: 2000, s
 precondition(AlertPolicy.evaluate(reading: high, marks: &marks, now: 1000).count == 1)
 precondition(AlertPolicy.evaluate(reading: high, marks: &marks, now: 1001).isEmpty)
 let newWindow = SavedReading(five: 95, seven: 10, fetchedAt: 1000, fiveReset: 4000, sevenReset: 5000)
-precondition(AlertPolicy.evaluate(reading: newWindow, marks: &marks, now: 1000).count == 1)
+precondition(AlertPolicy.evaluate(reading: newWindow, marks: &marks, now: 2001).count == 1)
 print("PASS: alerts deduplicate and rearm on a new window")
 
 let issues = OfflineRuntime(state: OfflineState(), save: { _ in })
