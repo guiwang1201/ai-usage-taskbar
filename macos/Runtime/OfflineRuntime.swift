@@ -26,6 +26,9 @@ struct SavedReading: Codable {
 }
 struct OfflineState: Codable {
     var selectedProvider = 0
+    var claudeSessionIdentity: String? = nil
+    var claudeOrganization: String? = nil
+    var claudeSessionExpired: Bool? = nil
     var notifications: Bool? = nil
     var alertMarks: [[AlertMark]]? = nil
     var showRemaining: Bool? = nil
@@ -67,11 +70,35 @@ final class OfflineRuntime {
     }
     func issue(_ provider: Int) -> String? {
         guard (0...1).contains(provider) else { return nil }
+        if provider == 0 && state.claudeSessionExpired == true { return "SessionKey 已失效，请重新配置 Claude 登录" }
         return localIssues[provider] ?? errors[provider]
     }
     func setLocalIssue(_ provider: Int, _ text: String?) {
         guard (0...1).contains(provider) else { return }
         localIssues[provider] = text
+    }
+    func configureClaude(identity: String?) throws {
+        var updated = state
+        if updated.claudeSessionIdentity != identity {
+            updated.readings[0] = nil
+            if updated.alertMarks?.count == 2 { updated.alertMarks?[0] = [AlertMark(), AlertMark()] }
+        }
+        updated.claudeSessionIdentity = identity
+        updated.claudeOrganization = nil
+        updated.claudeSessionExpired = false
+        try save(updated); state = updated
+        localIssues[0] = nil; errors[0] = nil
+    }
+    func completeClaudeSession(now: Int64, status: UInt16, retryAfter: UInt32, body: String, organization: String?, discovery: Bool) throws {
+        if status == 401 { state.claudeSessionExpired = true }
+        if discovery {
+            if status == 200 { state.claudeOrganization = organization }
+            try completeRefresh(provider: 0, now: now, status: status, retryAfter: retryAfter,
+                                label: status == 200 ? nil : "Claude 登录或组织读取失败，请检查 SessionKey 和组织 ID")
+        } else {
+            try complete(provider: 0, now: now, status: status, retryAfter: retryAfter, body: body)
+        }
+        if status == 401 { errors[0] = "SessionKey 已失效，请重新配置 Claude 登录" }
     }
     func select(_ provider: Int) throws {
         guard (0...1).contains(provider) else { return }
@@ -90,7 +117,7 @@ final class OfflineRuntime {
     }
     func consumeAlert(provider: Int, now: Int64) throws -> [String] {
         guard state.notifications == true, provider == state.selectedProvider,
-              issue(provider) == nil, let reading = state.readings[provider] else { return [] }
+              issue(provider) == nil, let reading = state.readings[provider], reading.fetchedAt >= state.gates[provider].lastAttempt else { return [] }
         var updated = state
         var marks = updated.alertMarks ?? [[AlertMark(), AlertMark()], [AlertMark(), AlertMark()]]
         guard marks.count == 2, marks.allSatisfy({ $0.count == 2 }) else { throw CocoaError(.fileReadCorruptFile) }

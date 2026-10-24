@@ -30,6 +30,8 @@ pub struct Section {
     pub retry: String,
     pub update_login: bool,
     pub failed: bool,
+    /// Codex on a free plan: shown as a short notice instead of bars, and not refreshed.
+    pub unsubscribed: bool,
 }
 
 pub type Panel = [Section; 2];
@@ -52,7 +54,9 @@ pub fn build(cache: &Cache, errors: &[Option<FetchError>; 2], ctx: &Context) -> 
 
 fn section(provider: Provider, entry: Option<&Entry>, error: Option<&FetchError>, ctx: &Context) -> Section {
     let usage = entry.map(|e| e.usage).unwrap_or_default();
+    let unsubscribed = matches!(error, Some(FetchError::Unsubscribed));
     let status = match (entry, error) {
+        _ if unsubscribed => describe(provider, &FetchError::Unsubscribed),
         (None, None) => "正在获取…".to_string(),
         (None, Some(error)) => describe(provider, error),
         (Some(entry), None) => match age(ctx.now - entry.fetched_at).as_str() {
@@ -71,7 +75,8 @@ fn section(provider: Provider, entry: Option<&Entry>, error: Option<&FetchError>
         provenance: entry.map_or_else(|| "尚无成功记录".into(), |e| format!("{} · 上次成功 {}", e.source.label(), clock(e.fetched_at, ctx.now, ctx.utc_offset))),
         retry: String::new(),
         update_login: provider == Provider::Claude && matches!(error, Some(FetchError::WebUnauthorized | FetchError::WebCredentials | FetchError::WebOrganization)),
-        failed: error.is_some(),
+        failed: error.is_some() && !unsubscribed,
+        unsubscribed,
     }
 }
 
@@ -166,6 +171,17 @@ mod tests {
         assert_eq!(x.rows[0].value, "--");
         assert_eq!(x.rows[0].fill, None);
         assert_eq!(x.status, "正在获取…");
+    }
+
+    #[test]
+    fn a_free_codex_account_is_a_notice_not_a_failure() {
+        let mut stale = claude();
+        stale.source = crate::cache::Source::Codex;
+        let panel = build(&[Some(claude()), Some(stale)], &[None, Some(FetchError::Unsubscribed)], &ctx());
+        assert!(panel[1].unsubscribed);
+        assert!(!panel[1].failed && !panel[1].update_login);
+        assert_eq!(panel[1].status, "未订阅付费套餐，已停止刷新");
+        assert!(!panel[0].unsubscribed);
     }
 
     #[test]

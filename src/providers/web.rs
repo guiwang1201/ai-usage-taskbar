@@ -83,7 +83,7 @@ pub fn fetch(session: &Session, http: Http, before_network: &mut dyn FnMut() -> 
     };
     before_network()?;
     let body = send(&session.request(format!("/api/organizations/{organization}/usage")), http)?;
-    parse(Provider::Claude, &body)
+    read_answer(Provider::Claude, &body)
 }
 
 #[cfg(test)]
@@ -124,6 +124,12 @@ mod tests {
         for key in ["", "x\r\nInjected: y", "x; other=y"] {
             assert_eq!(fetch(&Session { key: key.into(), organization: None }, never, &mut || Ok(())), Err(FetchError::WebCredentials));
         }
+    }
+    #[test]
+    fn an_organization_without_quota_windows_is_unsubscribed() {
+        let empty: Http = |_| Ok(Response { status: 200, body: r#"{"five_hour":null,"seven_day":null}"#.into(), retry_after: None });
+        let session = Session { key: "test-key".into(), organization: Some("org-1".into()) };
+        assert_eq!(fetch(&session, empty, &mut || Ok(())), Err(FetchError::Unsubscribed));
     }
     #[test]
     fn ambiguous_organizations_are_not_selected() {

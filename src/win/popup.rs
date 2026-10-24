@@ -4,7 +4,8 @@ use windows_sys::Win32::Foundation::RECT;
 
 use super::render::{draw_text, Align, Color, Font, Surface};
 use super::{badge, fill_color};
-use crate::panel::Panel;
+use crate::model::Provider;
+use crate::panel::{Panel, Section};
 
 // Layout in 96-dpi pixels.
 const WIDTH: f32 = 340.0;
@@ -24,20 +25,50 @@ const SECTION_GAP: f32 = 12.0;
 
 const ROW_H: f32 = LINE_H + BAR_GAP + BAR_H + DETAIL_GAP + DETAIL_H;
 const SECTION_H: f32 = HEADER_H + HEADER_GAP + ROW_H * 2.0 + ROW_GAP + STATUS_GAP + STATUS_H * 4.0;
-const HEIGHT: f32 = TOP * 2.0 + SECTION_H * 2.0 + SECTION_GAP * 2.0 + 1.0;
+/// A provider with nothing to show: its header, a notice and an action line.
+const NOTICE_H: f32 = HEADER_H + HEADER_GAP + STATUS_H * 2.0;
+/// The gaps and the rule between two sections.
+const DIVIDER_H: f32 = SECTION_GAP * 2.0 + 1.0;
 
 const WARNING_TEXT: Color = Color::rgb(245, 158, 11);
+const LINK_TEXT: Color = Color::rgb(45, 130, 225);
 
-pub fn update_hit(panel: &Panel, x: i32, y: i32, scale: f32) -> bool {
-    let x = x as f32 / scale;
-    let y = y as f32 / scale;
-    let top = TOP + SECTION_H - STATUS_H;
-    panel[0].update_login && (PAD..WIDTH-PAD).contains(&x) && (top..top+STATUS_H).contains(&y)
+fn section_h(section: &Section) -> f32 {
+    if section.unsubscribed { NOTICE_H } else { SECTION_H }
+}
+
+/// The clickable last line of a section, if it has one.
+fn link(section: &Section) -> Option<&'static str> {
+    if section.update_login {
+        Some("更新网页登录…  （点击或按 Enter）")
+    } else if section.unsubscribed && section.retry.is_empty() {
+        Some("已续订？点此重新检查")
+    } else {
+        None
+    }
+}
+
+/// Whose link is at (x, y), in physical pixels.
+pub fn link_hit(panel: &Panel, x: i32, y: i32, scale: f32) -> Option<Provider> {
+    let (x, y) = (x as f32 / scale, y as f32 / scale);
+    if !(PAD..WIDTH - PAD).contains(&x) {
+        return None;
+    }
+    let mut top = TOP;
+    for section in panel {
+        let bottom = top + section_h(section);
+        if link(section).is_some() && (bottom - STATUS_H..bottom).contains(&y) {
+            return Some(section.provider);
+        }
+        top = bottom + DIVIDER_H;
+    }
+    None
 }
 
 /// Window size in physical pixels.
-pub fn size(scale: f32) -> (i32, i32) {
-    ((WIDTH * scale).round() as i32, (HEIGHT * scale).round() as i32)
+pub fn size(scale: f32, panel: &Panel) -> (i32, i32) {
+    let height = TOP * 2.0 + panel.iter().map(section_h).sum::<f32>() + DIVIDER_H * (panel.len() - 1) as f32;
+    ((WIDTH * scale).round() as i32, (height * scale).round() as i32)
 }
 
 #[cfg(test)]
@@ -67,36 +98,50 @@ mod tests {
         });
         panel[1].retry = "等待至 明天 16:30 · 23 小时 59 分钟".into();
         panel[0].retry = "已暂停请求，更新登录后恢复".into();
+        let x = |scale: f32| (PAD * scale + 4.0) as i32;
         for scale in [1.0, 1.75] {
             let y = ((TOP + SECTION_H - STATUS_H / 2.0) * scale) as i32;
-            assert!(update_hit(&panel, (PAD * scale + 4.0) as i32, y, scale));
-            assert!(!update_hit(&panel, 0, y, scale));
-            assert!(!update_hit(&panel, (PAD * scale + 4.0) as i32, 0, scale));
+            assert_eq!(link_hit(&panel, x(scale), y, scale), Some(Provider::Claude));
+            assert_eq!(link_hit(&panel, 0, y, scale), None);
+            assert_eq!(link_hit(&panel, x(scale), 0, scale), None);
         }
-        for light in [false, true] {
-            for scale in [1.0, 1.75] {
-                let (w, h) = size(scale);
-                let mut surface = Surface::new(w, h).unwrap();
-                let mut scratch = Surface::new(w, h).unwrap();
-                paint(&mut surface, &mut scratch, &panel, light, scale);
-                assert!(surface.pixels().iter().all(|p| p >> 24 == 255));
-                if let Some(dir) = std::env::var_os("IUSAGE_TEST_RENDER_DIR") {
-                    let dir = std::path::PathBuf::from(dir);
-                    std::fs::create_dir_all(&dir).unwrap();
-                    let mut bmp = Vec::new();
-                    bmp.extend_from_slice(b"BM");
-                    bmp.extend_from_slice(&(54 + w as u32 * h as u32 * 4).to_le_bytes());
-                    bmp.extend_from_slice(&[0; 4]);
-                    bmp.extend_from_slice(&54u32.to_le_bytes());
-                    bmp.extend_from_slice(&40u32.to_le_bytes());
-                    bmp.extend_from_slice(&w.to_le_bytes());
-                    bmp.extend_from_slice(&(-h).to_le_bytes());
-                    bmp.extend_from_slice(&1u16.to_le_bytes());
-                    bmp.extend_from_slice(&32u16.to_le_bytes());
-                    bmp.extend_from_slice(&[0; 24]);
-                    for pixel in surface.pixels() { bmp.extend_from_slice(&pixel.to_le_bytes()); }
-                    let name = format!("panel-{}-{}.bmp", if light { "light" } else { "dark" }, (scale * 100.0) as u32);
-                    std::fs::write(dir.join(name), bmp).unwrap();
+        // Codex on a free plan shrinks to a notice whose last line asks for a recheck.
+        let mut free = panel.clone();
+        free[1] = panel::build(&[None, None], &[None, Some(FetchError::Unsubscribed)], &Context {
+            current: Provider::Claude, show_remaining: false, thresholds: Thresholds::default(), now, utc_offset: 8 * 3600,
+        })[1].clone();
+        assert!(size(1.0, &free).1 < size(1.0, &panel).1);
+        let codex_link = TOP + SECTION_H + DIVIDER_H + NOTICE_H - STATUS_H / 2.0;
+        assert_eq!(link_hit(&free, x(1.0), codex_link as i32, 1.0), Some(Provider::Codex));
+        assert_eq!(link_hit(&free, x(1.0), (codex_link - STATUS_H) as i32, 1.0), None);
+        free[1].retry = "正在重新检查…".into();
+        assert_eq!(link_hit(&free, x(1.0), codex_link as i32, 1.0), None, "no second click while one is pending");
+        for (name, panel) in [("panel", &panel), ("free", &free)] {
+            for light in [false, true] {
+                for scale in [1.0, 1.75] {
+                    let (w, h) = size(scale, panel);
+                    let mut surface = Surface::new(w, h).unwrap();
+                    let mut scratch = Surface::new(w, h).unwrap();
+                    paint(&mut surface, &mut scratch, panel, light, scale);
+                    assert!(surface.pixels().iter().all(|p| p >> 24 == 255));
+                    if let Some(dir) = std::env::var_os("IUSAGE_TEST_RENDER_DIR") {
+                        let dir = std::path::PathBuf::from(dir);
+                        std::fs::create_dir_all(&dir).unwrap();
+                        let mut bmp = Vec::new();
+                        bmp.extend_from_slice(b"BM");
+                        bmp.extend_from_slice(&(54 + w as u32 * h as u32 * 4).to_le_bytes());
+                        bmp.extend_from_slice(&[0; 4]);
+                        bmp.extend_from_slice(&54u32.to_le_bytes());
+                        bmp.extend_from_slice(&40u32.to_le_bytes());
+                        bmp.extend_from_slice(&w.to_le_bytes());
+                        bmp.extend_from_slice(&(-h).to_le_bytes());
+                        bmp.extend_from_slice(&1u16.to_le_bytes());
+                        bmp.extend_from_slice(&32u16.to_le_bytes());
+                        bmp.extend_from_slice(&[0; 24]);
+                        for pixel in surface.pixels() { bmp.extend_from_slice(&pixel.to_le_bytes()); }
+                        let name = format!("{name}-{}-{}.bmp", if light { "light" } else { "dark" }, (scale * 100.0) as u32);
+                        std::fs::write(dir.join(name), bmp).unwrap();
+                    }
                 }
             }
         }
@@ -151,6 +196,15 @@ pub fn paint(surface: &mut Surface, scratch: &mut Surface, panel: &Panel, light:
             }
             y += HEADER_H + HEADER_GAP;
 
+            if section.unsubscribed {
+                texts.push(Text { face: Face::Small, text: &section.status, y, h: STATUS_H, align: Align::Left, color: secondary });
+                y += STATUS_H;
+                let (text, color) = link(section).map_or((section.retry.as_str(), secondary), |link| (link, LINK_TEXT));
+                texts.push(Text { face: Face::Small, text, y, h: STATUS_H, align: Align::Left, color });
+                y += STATUS_H;
+                continue;
+            }
+
             for (n, row) in section.rows.iter().enumerate() {
                 if n > 0 {
                     y += ROW_GAP;
@@ -176,8 +230,8 @@ pub fn paint(surface: &mut Surface, scratch: &mut Surface, panel: &Panel, light:
             y += STATUS_H;
             texts.push(Text { face: Face::Small, text: &section.retry, y, h: STATUS_H, align: Align::Left, color: secondary });
             y += STATUS_H;
-            if section.update_login {
-                texts.push(Text { face: Face::Small, text: "更新网页登录…  （点击或按 Enter）", y, h: STATUS_H, align: Align::Left, color: Color::rgb(45, 130, 225) });
+            if let Some(link) = link(section) {
+                texts.push(Text { face: Face::Small, text: link, y, h: STATUS_H, align: Align::Left, color: LINK_TEXT });
             }
             y += STATUS_H;
         }

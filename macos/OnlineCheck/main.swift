@@ -22,14 +22,19 @@ for provider in 0...1 {
     }
     var counted = false
     do {
-        let credential = try provider == 0 ? sources.claude() : sources.codex()
         remaining += 1
         counted = true
-        let started = try coordinator.fetch(provider: provider, token: credential.accessToken, account: credential.accountID, claudeVersion: sources.claudeVersion()) { error in
+        let completion: (Error?) -> Void = { error in
             if error != nil { print("\(name): persistence failed; no retry") }
             else if let status = runtime.errors[provider] { print("\(name): \(status); retry state saved") }
-            else { print("\(name): response parsed and cached") }
+            else { print("\(name): request completed; discovery may precede usage") }
             remaining -= 1
+        }
+        let started: Bool
+        if provider == 0 { started = try coordinator.fetchClaude(session: ClaudeSession.load(), completion: completion) }
+        else {
+            let credential = try sources.codex()
+            started = try coordinator.fetch(provider: 1, token: credential.accessToken, account: credential.accountID, completion: completion)
         }
         if !started { remaining -= 1; print("\(name): request gate refused") }
     } catch {

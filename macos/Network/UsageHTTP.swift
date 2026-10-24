@@ -31,6 +31,13 @@ final class UsageHTTP: NSObject, URLSessionDataDelegate {
     static func allowed(method: String, url: URL) -> Bool {
         guard url.scheme == "https", url.user == nil, url.password == nil, url.port == nil,
               url.query == nil, url.fragment == nil, let host = url.host else { return false }
+        if method == "GET", host == "claude.ai" {
+            let parts = url.path.split(separator: "/")
+            if url.path == "/api/organizations" { return true }
+            return parts.count == 4 && parts[0] == "api" && parts[1] == "organizations" && parts[3] == "usage"
+                && !parts[2].isEmpty && parts[2].utf8.count <= 128
+                && parts[2].utf8.allSatisfy { (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || $0 == 45 }
+        }
         switch (method, host, url.path) {
         case ("GET", "api.anthropic.com", "/api/oauth/usage"),
              ("GET", "chatgpt.com", "/backend-api/wham/usage"),
@@ -55,13 +62,13 @@ final class UsageHTTP: NSObject, URLSessionDataDelegate {
     }
     static func retryAfter(_ value: String?, now: Date = Date()) -> UInt32? {
         guard let value else { return nil }
-        if let seconds = UInt64(value.trimmingCharacters(in: .whitespaces)) { return UInt32(min(seconds, 3600)) }
+        if let seconds = UInt64(value.trimmingCharacters(in: .whitespaces)) { return UInt32(min(seconds, UInt64(UInt32.max))) }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
         guard let date = formatter.date(from: value) else { return nil }
-        return UInt32(min(3600, max(0, ceil(date.timeIntervalSince(now)))))
+        return UInt32(min(Double(UInt32.max), max(0, ceil(date.timeIntervalSince(now)))))
     }
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {

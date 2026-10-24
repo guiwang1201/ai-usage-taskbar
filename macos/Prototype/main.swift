@@ -7,7 +7,6 @@ final class Prototype: NSObject, NSApplicationDelegate {
     private var loadingCredentials = false
     private var activeTransports: [UsageHTTP] = []
     private var coordinator: FetchCoordinator!
-    private var renewal: ClaudeRenewal!
     private var item: NSStatusItem!
     private let bars = UsageBars(frame: NSRect(x: 0, y: 0, width: 148, height: 22))
     private let popover = NSPopover()
@@ -49,14 +48,6 @@ final class Prototype: NSObject, NSApplicationDelegate {
             let transport = UsageHTTP(configuration: .ephemeral)
             self?.activeTransports.append(transport)
             transport.get(url: url, headers: headers) { result in
-                callback(result)
-                DispatchQueue.main.async { self?.activeTransports.removeAll { $0 === transport } }
-            }
-        }
-        renewal = ClaudeRenewal(runtime: runtime, store: ClaudeStore(), now: { Int64(Date().timeIntervalSince1970) }) { [weak self] url, headers, body, callback in
-            let transport = UsageHTTP(configuration: .ephemeral)
-            self?.activeTransports.append(transport)
-            transport.post(url: url, headers: headers, body: body) { result in
                 callback(result)
                 DispatchQueue.main.async { self?.activeTransports.removeAll { $0 === transport } }
             }
@@ -103,7 +94,7 @@ final class Prototype: NSObject, NSApplicationDelegate {
         let hint = label(live ? "正常 3 分钟 · 空闲 15 分钟刷新" : cachedOnly ? "只读缓存 · 无网络请求" : "模拟调度 · 未连接服务", size: 10)
         hint.textColor = .secondaryLabelColor
         footer.addArrangedSubview(hint)
-        footer.addArrangedSubview(NSButton(title: "退出原型", target: self, action: #selector(quit)))
+        footer.addArrangedSubview(NSButton(title: "退出", target: self, action: #selector(quit)))
         stack.addArrangedSubview(footer)
         popover.contentViewController = controller
         popover.contentSize = root.frame.size
@@ -198,7 +189,8 @@ final class Prototype: NSObject, NSApplicationDelegate {
             let age = reading.map { max(0, now - $0.fetchedAt) }
             let updated = age.map { "\($0 / 60) 分钟前更新" } ?? "暂无数据"
             let issue = runtime.issue(provider)
-            sectionStatuses[provider].stringValue = issue.map { reading == nil ? "\($0) · 暂无数据" : "\($0) · 显示缓存 · \(updated)" } ?? "\(cachedOnly ? "真实缓存" : "模拟数据") · \(updated)"
+            let source = !cachedOnly ? "模拟数据" : provider == 0 ? (runtime.state.claudeSessionIdentity == nil ? "旧缓存" : "Claude 网页") : "Codex"
+            sectionStatuses[provider].stringValue = issue.map { reading == nil ? "\($0) · 暂无数据" : "\($0) · 显示缓存 · \(updated)" } ?? "\(source) · \(updated)"
             let values = reading?.values(now: now) ?? [nil, nil]
             for index in 0...1 {
                 if cachedOnly {
@@ -237,10 +229,13 @@ final class Prototype: NSObject, NSApplicationDelegate {
             if tag == 1 { menu.addItem(.separator()) }
         }
         menu.addItem(.separator())
+        let login = NSMenuItem(title: "配置 Claude SessionKey…", action: #selector(configureClaude), keyEquivalent: "")
+        login.target = self; login.isEnabled = live && !loadingCredentials && activeTransports.isEmpty
+        menu.addItem(login)
         let refresh = NSMenuItem(title: "立即刷新", action: #selector(settingSelected(_:)), keyEquivalent: "")
         refresh.target = self; refresh.tag = 4
         var gate = runtime.state.gates[runtime.state.selectedProvider].native
-        refresh.isEnabled = (!cachedOnly || live) && !loadingCredentials && iusage_can_request(&gate, Int64(Date().timeIntervalSince1970))
+        refresh.isEnabled = (!cachedOnly || live) && !loadingCredentials && !(runtime.state.selectedProvider == 0 && runtime.state.claudeSessionExpired == true) && iusage_can_request(&gate, Int64(Date().timeIntervalSince1970))
         menu.addItem(refresh)
         let notifications = NSMenuItem(title: "低额度提醒", action: #selector(settingSelected(_:)), keyEquivalent: "")
         notifications.target = self; notifications.tag = 5
@@ -330,6 +325,7 @@ final class Prototype: NSObject, NSApplicationDelegate {
     private func scheduleNext() {
         timer?.invalidate()
         guard !cachedOnly || live else { return }
+        if runtime.state.selectedProvider == 0 && runtime.state.claudeSessionExpired == true { return }
         let now = Int64(Date().timeIntervalSince1970)
         let due = runtime.nextEvent(provider: runtime.state.selectedProvider, now: now, idle: userAway)
         let next = Timer(timeInterval: TimeInterval(max(1, due - now)), target: self, selector: #selector(mockTick), userInfo: nil, repeats: false)
@@ -356,26 +352,19 @@ final class Prototype: NSObject, NSApplicationDelegate {
         loadingCredentials = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let sources = LocalSources(home: FileManager.default.homeDirectoryForCurrentUser, environment: ProcessInfo.processInfo.environment, reader: CredentialReader())
-            // Claude's stored text is kept with its source: an expired token is renewed
-            // from it and written back to the same place.
-            let claudeRecord = provider == 0 ? Result { try sources.claudeRecord() } : nil
-            let loaded: Result<OAuthCredential, Error> = claudeRecord.map { read in
-                read.flatMap { record in Result { try CredentialReader.parseClaude(record.data, now: Date()) } }
-            } ?? Result { try sources.codex() }
-            let record = try? claudeRecord?.get()
-            let version = sources.claudeVersion()
+            let session = provider == 0 ? Result { try ClaudeSession.load() } : nil
+            let loaded = provider == 1 ? Result { try sources.codex() } : nil
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.loadingCredentials = false
-                let credential: OAuthCredential
-                do { credential = try loaded.get() }
-                catch {
-                    if let record, (error as? CredentialFailure) == .expired {
-                        self.renewClaude(record, version: version)
-                        return
-                    }
-                    // Shown, and rechecked locally; no request and no Keychain prompt.
-                    self.hold(provider, LocalIssue(error, provider: provider))
+                do {
+                    if let session { _ = try session.get() }
+                    if let loaded { _ = try loaded.get() }
+                } catch {
+                    if provider == 0 {
+                        self.runtime.setLocalIssue(0, "请配置 Claude SessionKey（右键菜单）· 登录信息不可用")
+                        self.refreshDisplay(); self.scheduleRecheck(after: 60)
+                    } else { self.hold(provider, LocalIssue(error, provider: provider)) }
                     return
                 }
                 if self.runtime.localIssues[provider] != nil {
@@ -389,7 +378,7 @@ final class Prototype: NSObject, NSApplicationDelegate {
                     return
                 }
                 do {
-                    let started = try self.coordinator.fetch(provider: provider, token: credential.accessToken, account: credential.accountID, claudeVersion: version) { [weak self] error in
+                    let completion: (Error?) -> Void = { [weak self] error in
                         guard let self else { return }
                         self.updateBars()
                         guard error == nil else { self.pause(provider); return }
@@ -398,6 +387,13 @@ final class Prototype: NSObject, NSApplicationDelegate {
                             if !lines.isEmpty { SystemFeatures.notify(provider: provider == 0 ? "Claude" : "Codex", lines: lines) }
                         } catch { self.pause(provider); return }
                         self.scheduleNext()
+                    }
+                    let started: Bool
+                    if let session {
+                        started = try self.coordinator.fetchClaude(session: session.get(), completion: completion)
+                    } else {
+                        let credential = try loaded!.get()
+                        started = try self.coordinator.fetch(provider: 1, token: credential.accessToken, account: credential.accountID, completion: completion)
                     }
                     if !started { self.scheduleNext() }
                 } catch UsageHTTP.Failure.invalidEndpoint {
@@ -408,24 +404,35 @@ final class Prototype: NSObject, NSApplicationDelegate {
             }
         }
     }
-    private func renewClaude(_ record: ClaudeCredentialRecord, version: String?) {
+    @objc private func configureClaude() {
+        guard !loadingCredentials, activeTransports.isEmpty else { return }
+        timer?.invalidate()
+        loadingCredentials = true
+        defer { loadingCredentials = false; scheduleNext() }
+        let alert = NSAlert()
+        alert.messageText = "Claude 网页登录"
+        alert.informativeText = "在 claude.ai 登录后，从浏览器开发者工具的 Cookie 中复制 sessionKey。只保存在本机钥匙串，不依赖 Claude Code。组织 ID 可留空；多个组织时需手动指定。保存不会清除限流等待。"
+        let fields = NSStackView(); fields.orientation = .vertical; fields.spacing = 8
+        let key = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        key.placeholderString = "sessionKey（请粘贴新值）"
+        let org = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        org.placeholderString = "组织 ID（可选）"
+        fields.addArrangedSubview(key); fields.addArrangedSubview(org)
+        fields.frame = NSRect(x: 0, y: 0, width: 340, height: 60)
+        alert.accessoryView = fields
+        alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消"); alert.addButton(withTitle: "清除登录")
+        NSApp.activate(ignoringOtherApps: true)
+        let choice = alert.runModal()
+        guard choice != .alertSecondButtonReturn else { return }
         do {
-            try renewal.renew(record: record, version: version) { [weak self] outcome in
-                guard let self else { return }
-                switch outcome {
-                case .notNeeded: self.scheduleRecheck(after: 2)
-                case .wait:
-                    // The gate is holding a limit or the minimum gap; the schedule knows when.
-                    self.runtime.setLocalIssue(0, LocalIssue.awaitingRenewal.label)
-                    self.refreshDisplay()
-                    self.scheduleNext()
-                case .issue(let issue): self.hold(0, issue)
-                case .finished:
-                    self.refreshDisplay()
-                    self.scheduleNext()
-                }
-            }
-        } catch { pause(0) }
+            let session = choice == .alertThirdButtonReturn ? nil : try ClaudeSession(key.stringValue, organization: org.stringValue)
+            try ClaudeSession.save(session)
+            try runtime.configureClaude(identity: session?.identity)
+            refreshDisplay(); scheduleNext()
+        } catch {
+            let failure = NSAlert(); failure.messageText = "无法保存 Claude 登录"
+            failure.informativeText = "请检查 SessionKey、组织 ID 格式及钥匙串访问权限。"; failure.runModal()
+        }
     }
     private func refreshDisplay() { updateBars(); updateDetails() }
     private func hold(_ provider: Int, _ issue: LocalIssue) {

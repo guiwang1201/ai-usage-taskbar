@@ -105,7 +105,7 @@ do {
     let w = World()
     let before = credentials(refresh: "swift-refused", expiresAt: now - 60)
     w.keychain = before
-    w.reply = .success(.init(status: 400, body: Data(), retryAfter: nil))
+    w.reply = .success(.init(status: 400, body: Data(#"{"error":"invalid_grant"}"#.utf8), retryAfter: nil))
     check(w.renew() == .finished(ClaudeRenewal.refusedLabel))
     check(w.keychain == before)
     check(w.saved.gates[0].blockedUntil >= now + 300 && w.runtime.issue(0) == ClaudeRenewal.refusedLabel)

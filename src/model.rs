@@ -107,6 +107,9 @@ pub enum FetchError {
     WebOrganization,
     /// Restored cooldown proves the previous request failed; detailed errors are not persisted.
     PreviousFailure,
+    /// The service answered, but the account has no paid quota: Codex reports a free
+    /// plan, Claude reports no window at all. There is nothing worth polling.
+    Unsubscribed,
     Http(u16),
     Network(String),
     Parse,

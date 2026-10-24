@@ -163,6 +163,16 @@ fn idle_secs() -> i64 {
     }
 }
 
+/// Whether the provider's sign-in has changed since it was found without paid quota at
+/// `unpaid`. A Claude web login is not a file of theirs: updating it in our own dialog
+/// clears the pause directly.
+fn login_changed(provider: Provider, env: &Env, settings: &Settings, unpaid: i64) -> bool {
+    if provider == Provider::Claude && web_login::is_web(settings) {
+        return false;
+    }
+    providers::signed_in_at(provider, env).is_some_and(|at| at > unpaid)
+}
+
 /// Runs `f` on the app state. Returns `None` when the state is already borrowed, which
 /// happens when a Win32 call made from inside a handler re-enters a window procedure.
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
@@ -222,6 +232,8 @@ struct App {
     fetching: Option<(Provider, JoinHandle<Result<(Usage, cache::Source), FetchError>>)>,
     discard_claude_result: bool,
     web_expired: bool,
+    /// See `Stored::unpaid`.
+    unpaid: [i64; 2],
     light: bool,
     shown: Option<Shown>,
     drag: Option<Drag>,
@@ -250,6 +262,10 @@ pub fn check() {
         }
         let now = unix_now();
         let i = provider.index();
+        if stored.unpaid[i] != 0 && !login_changed(provider, &env, &settings, stored.unpaid[i]) {
+            let _ = writeln!(out, "{}: no paid quota; refresh paused until its sign-in changes.", provider.name());
+            continue;
+        }
         if !stored.schedule[i].can_request(now) {
             let _ = writeln!(out, "{}: skipped (request cooldown)", provider.name());
             continue;
@@ -275,8 +291,16 @@ pub fn check() {
                     alert::rearm(&mut announced, &previous.usage, &usage, now);
                 }
                 stored.cache[i] = Some(Entry { usage, source, fetched_at: now, announced });
+                stored.unpaid[i] = 0;
                 let v = view::build(provider, Some(&usage), None, false, Thresholds::default(), now);
                 format!("{}: 5h {} | 7d {}", provider.name(), v.rows[0].text, v.rows[1].text)
+            }
+            Err(FetchError::Unsubscribed) => {
+                let now = unix_now();
+                stored.schedule[i].succeeded(now, settings.poll_secs);
+                stored.unpaid[i] = now;
+                stored.cache[i] = None;
+                format!("{}: no paid quota; refresh paused", provider.name())
             }
             Err(error) => {
                 stored.schedule[i].failed(&error, unix_now());
@@ -331,7 +355,7 @@ pub fn run() {
         let settings_path = settings_dir.join("settings.json");
         let cache_path = settings_dir.join("cache.json");
         let settings = Settings::load(&settings_path);
-        let Stored { cache, mut schedule, web_expired } = cache::load(&cache_path);
+        let Stored { cache, mut schedule, web_expired, unpaid } = cache::load(&cache_path);
         // A reading that is still fresh is shown as is; nothing is requested until it
         // ages out. Times in the future are capped so a clock that was set back cannot
         // stall us. A wait the service imposed on an earlier run carries over as loaded.
@@ -343,6 +367,10 @@ pub fn run() {
             }
         }
         let mut errors = schedule.map(|gate| (gate.backoff > 0).then_some(FetchError::PreviousFailure));
+        for (error, since) in errors.iter_mut().zip(unpaid) {
+            if since != 0 { *error = Some(FetchError::Unsubscribed); }
+        }
+        // An expired web login is the thing to act on first.
         if web_expired && web_login::is_web(&settings) { errors[0] = Some(FetchError::WebUnauthorized); }
         let app = App {
             main,
@@ -361,6 +389,7 @@ pub fn run() {
             fetching: None,
             discard_claude_result: false,
             web_expired,
+            unpaid,
             light: system_uses_light_theme(),
             shown: None,
             drag: None,
@@ -476,9 +505,14 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
     match msg {
         WM_LBUTTONUP => {
             with_app(|app| {
-                let hit = app.popup.as_ref().is_some_and(|p| p.shown.as_ref().is_some_and(|(panel, _)|
-                    popup::update_hit(panel, (lparam & 0xffff) as i16 as i32, ((lparam >> 16) & 0xffff) as i16 as i32, p.scale)));
-                if hit { app.open_web_config(); app.close_popup(); }
+                let hit = app.popup.as_ref().and_then(|p| p.shown.as_ref().and_then(|(panel, _)|
+                    popup::link_hit(panel, (lparam & 0xffff) as i16 as i32, ((lparam >> 16) & 0xffff) as i16 as i32, p.scale)
+                        .map(|provider| (provider, panel[provider.index()].update_login))));
+                match hit {
+                    Some((_, true)) => { app.open_web_config(); app.close_popup(); }
+                    Some((provider, false)) => app.recheck(provider),
+                    None => {}
+                }
             });
             0
         }
@@ -646,10 +680,30 @@ impl App {
         for provider in wanted.into_iter().flatten() {
             let i = provider.index();
             let last_success = self.cache[i].map(|entry| entry.fetched_at);
-            if self.schedule[i].due(last_success, away, now) {
-                self.start_fetch(provider);
+            if !self.schedule[i].due(last_success, away, now) {
+                continue;
             }
+            // An account without paid quota is asked again only once its sign-in changes,
+            // or when the user asks. Until then its file is looked at once per interval.
+            if self.unpaid[i] != 0 && !login_changed(provider, &self.env, &self.settings, self.unpaid[i]) {
+                self.schedule[i].next_poll = now + i64::from(self.settings.poll_secs);
+                continue;
+            }
+            self.start_fetch(provider);
         }
+    }
+
+    /// The user says the account may be paid again: ask once more, as soon as the request
+    /// gates allow. No paid quota found then pauses it again.
+    unsafe fn recheck(&mut self, provider: Provider) {
+        let i = provider.index();
+        if self.unpaid[i] == 0 {
+            return;
+        }
+        self.unpaid[i] = 0;
+        self.schedule[i].next_poll = 0;
+        self.fetch_if_due();
+        self.refresh();
     }
 
     /// Whether "refresh now" may send a request for the displayed provider.
@@ -659,9 +713,13 @@ impl App {
         self.fetching.is_none() && !(i == 0 && self.web_expired && web_login::is_web(&self.settings)) && self.schedule[i].can_request(now)
     }
 
+    fn stored(&self) -> Stored {
+        Stored { cache: self.cache, schedule: self.schedule, web_expired: self.web_expired, unpaid: self.unpaid }
+    }
+
     fn save_cache(&self) {
         // Best effort: without the file a restart just fetches again.
-        let _ = cache::save(&self.cache_path, &Stored { cache: self.cache, schedule: self.schedule, web_expired: self.web_expired });
+        let _ = cache::save(&self.cache_path, &self.stored());
     }
 
     unsafe fn toggle_popup(&mut self) {
@@ -683,7 +741,7 @@ impl App {
         } else {
             GetDpiForWindow(self.main).max(96) as f32 / 96.0
         };
-        let (w, h) = popup::size(scale);
+        let (w, h) = popup::size(scale, &self.panel());
         let (Some(surface), Some(scratch)) = (Surface::new(w, h), Surface::new(w, h)) else {
             return;
         };
@@ -736,11 +794,8 @@ impl App {
         }
     }
 
-    /// Redraws the panel's surface if its content has changed.
-    unsafe fn refresh_popup(&mut self) {
-        let Some(popup) = self.popup.as_mut() else {
-            return;
-        };
+    /// What the detail panel shows right now.
+    unsafe fn panel(&self) -> Panel {
         let context = panel::Context {
             current: self.settings.provider,
             show_remaining: self.settings.show_remaining,
@@ -764,10 +819,44 @@ impl App {
                     format!("更新登录后仍需等待至 {}", crate::timefmt::clock(gate.blocked_until, context.now, context.utc_offset))
                 } else { "已暂停请求，更新登录后恢复".into() };
             }
+            if section.unsubscribed {
+                // Empty while a recheck may be asked for; otherwise when the asked one runs.
+                let at = gate.blocked_until.max(gate.last_attempt.saturating_add(schedule::MIN_GAP_SECS));
+                section.retry = if self.unpaid[section.provider.index()] != 0 {
+                    String::new()
+                } else if at > context.now && !self.fetching.as_ref().is_some_and(|(p, _)| *p == section.provider) {
+                    format!("将于 {} 重新检查", crate::timefmt::clock(at, context.now, context.utc_offset))
+                } else {
+                    "正在重新检查…".into()
+                };
+            }
         }
-        let content = (sections, self.light);
+        sections
+    }
+
+    /// Redraws the panel's surface if its content has changed.
+    unsafe fn refresh_popup(&mut self) {
+        if self.popup.is_none() {
+            return;
+        }
+        let content = (self.panel(), self.light);
+        let Some(popup) = self.popup.as_mut() else {
+            return;
+        };
         if popup.shown.as_ref() == Some(&content) {
             return;
+        }
+        let (w, h) = popup::size(popup.scale, &content.0);
+        if h != popup.surface.h {
+            // A section changed between bars and a notice: keep the bottom edge in place.
+            let (Some(surface), Some(scratch)) = (Surface::new(w, h), Surface::new(w, h)) else {
+                return;
+            };
+            let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            GetWindowRect(popup.hwnd, &mut rect);
+            SetWindowPos(popup.hwnd, null_mut(), rect.left, rect.bottom - h, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            popup.surface = surface;
+            popup.scratch = scratch;
         }
         popup::paint(&mut popup.surface, &mut popup.scratch, &content.0, content.1, popup.scale);
         popup.shown = Some(content);
@@ -1007,7 +1096,7 @@ impl App {
             return;
         }
         self.schedule[i].started(now);
-        let stored = Stored { cache: self.cache, schedule: self.schedule, web_expired: self.web_expired };
+        let stored = self.stored();
         let cache_path = self.cache_path.clone();
         let env = Arc::clone(&self.env);
         let settings = self.settings.clone();
@@ -1051,7 +1140,7 @@ impl App {
         if provider == Provider::Claude && self.discard_claude_result {
             self.discard_claude_result = false;
             match result {
-                Ok(_) => self.schedule[i].succeeded(now, self.settings.poll_secs),
+                Ok(_) | Err(FetchError::Unsubscribed) => self.schedule[i].succeeded(now, self.settings.poll_secs),
                 Err(ref error) => self.schedule[i].failed(error, now),
             }
             self.save_cache();
@@ -1075,12 +1164,22 @@ impl App {
                 }
                 self.cache[i] = Some(Entry { usage, source, fetched_at: now, announced });
                 if provider == Provider::Claude && source == cache::Source::Web { self.web_expired = false; }
+                self.unpaid[i] = 0;
                 self.error[i] = None;
                 self.schedule[i].succeeded(now, self.settings.poll_secs);
                 self.save_cache();
                 if let Some(alert) = alert {
                     self.notify(provider, &alert);
                 }
+            }
+            Err(FetchError::Unsubscribed) => {
+                // The service answered normally: no backoff, nothing for the error file,
+                // and the reading from when the account was paid no longer applies.
+                self.schedule[i].succeeded(now, self.settings.poll_secs);
+                self.unpaid[i] = now;
+                self.cache[i] = None;
+                self.error[i] = Some(FetchError::Unsubscribed);
+                self.save_cache();
             }
             Err(error) => {
                 self.schedule[i].failed(&error, now);
@@ -1162,6 +1261,7 @@ impl App {
         }
         self.settings = settings;
         self.web_expired = false;
+        self.unpaid[0] = 0;
         // Credentials may refer to a different account. Never label the old result as new.
         self.cache[0] = None;
         self.error[0] = None;

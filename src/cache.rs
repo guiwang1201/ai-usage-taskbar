@@ -47,6 +47,9 @@ pub fn mark_web_expired(expired: &mut bool, error: &crate::model::FetchError) ->
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Stored {
     pub web_expired: bool,
+    /// Per provider, the Unix seconds at which it was last found without paid quota; 0
+    /// while it has quota or nothing is known. Such a provider is not polled.
+    pub unpaid: [i64; 2],
     pub cache: Cache,
     pub schedule: [State; 2],
 }
@@ -57,6 +60,13 @@ pub fn load(path: &Path) -> Stored {
     let Ok(text) = json::read_small_file(path) else { return stored };
     let Some(root) = json::parse(&text) else { return stored };
     stored.web_expired = matches!(get(&root, "web_expired"), Some(JsonValue::Boolean(true)));
+    // 0.1.6 kept only Codex's, under its own key.
+    stored.unpaid[1] = get(&root, "codex_unpaid").and_then(timestamp).unwrap_or(0);
+    if let Some(JsonValue::Array(times)) = get(&root, "unpaid") {
+        for (slot, time) in stored.unpaid.iter_mut().zip(times) {
+            *slot = timestamp(time).unwrap_or(0);
+        }
+    }
     for provider in Provider::ALL {
         stored.cache[provider.index()] = get(&root, provider.key()).and_then(entry);
         stored.schedule[provider.index()].last_attempt = stored.cache[provider.index()].map_or(0, |e| e.fetched_at);
@@ -103,6 +113,7 @@ pub fn save(path: &Path, stored: &Stored) -> std::io::Result<()> {
         .collect();
     // Keep the old cooldown field readable by an older executable as well.
     entries.push(format!("\"web_expired\":{}", stored.web_expired));
+    entries.push(format!("\"unpaid\":[{},{}]", stored.unpaid[0], stored.unpaid[1]));
     entries.push(format!("\"blocked_until\":[{},{}]", stored.schedule[0].blocked_until, stored.schedule[1].blocked_until));
     let states = stored.schedule.map(|s| format!(
         "{{\"last_attempt\":{},\"next_poll\":{},\"blocked_until\":{},\"backoff\":{}}}",
@@ -185,6 +196,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("iusage-cache-test-{}.json", std::process::id()));
         let stored = Stored {
             web_expired: true,
+            unpaid: [1_790_000_050, 1_790_000_100],
             cache: [
                 Some(Entry {
                     source: Source::Web,
@@ -204,6 +216,7 @@ mod tests {
 
         let other = Stored {
             web_expired: false,
+            unpaid: [0, 0],
             cache: [None, Some(Entry { source: Source::Unknown, fetched_at: 5, announced: [0, 0], usage: Usage::default() })],
             schedule: [State::default(), State { blocked_until: 77, ..State::default() }],
         };
@@ -242,6 +255,14 @@ mod tests {
         assert_eq!(stored.schedule[0].last_attempt, 9);
         assert_eq!(stored.schedule[0].blocked_until, 0);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_codex_pause_written_by_0_1_6_is_kept() {
+        let path = std::env::temp_dir().join(format!("iusage-cache-unpaid-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"codex_unpaid":1790000100}"#).unwrap();
+        assert_eq!(load(&path).unpaid, [0, 1_790_000_100]);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

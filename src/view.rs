@@ -140,6 +140,7 @@ fn short_label(error: &FetchError) -> String {
         FetchError::WebUnauthorized => "网页已过期".to_string(),
         FetchError::WebForbidden => "网页受阻".to_string(),
         FetchError::PreviousFailure => "待更新".to_string(),
+        FetchError::Unsubscribed => "未订阅".to_string(),
         FetchError::Network(_) => "离线".to_string(),
         FetchError::Http(code) => format!("HTTP {code}"),
         FetchError::Parse => "错误".to_string(),
@@ -170,6 +171,11 @@ pub fn describe(provider: Provider, error: &FetchError) -> String {
         FetchError::WebForbidden => "网页访问受阻（403），请在浏览器检查验证".to_string(),
         FetchError::WebOrganization => "请选择组织：右键 → Claude 数据来源 → 配置 → 高级设置".to_string(),
         FetchError::PreviousFailure => "上次请求失败，等待更新".to_string(),
+        // Codex names its plan; for Claude it is inferred from an answer without windows.
+        FetchError::Unsubscribed => match provider {
+            Provider::Claude => "未返回任何额度（可能未订阅），已停止刷新".to_string(),
+            Provider::Codex => "未订阅付费套餐，已停止刷新".to_string(),
+        },
         FetchError::Network(_) => "网络不通，请检查代理".to_string(),
         FetchError::Http(code) => format!("服务返回 HTTP {code}"),
         FetchError::Parse => "返回内容无法识别".to_string(),
@@ -273,6 +279,19 @@ mod tests {
         assert_eq!(label(FetchError::Http(503)), "HTTP 503");
         assert_eq!(label(FetchError::Network("x".into())), "离线");
         assert_eq!(label(FetchError::Parse), "错误");
+        assert_eq!(label(FetchError::Unsubscribed), "未订阅");
+    }
+
+    #[test]
+    fn a_free_codex_account_reads_as_unsubscribed_not_failed() {
+        let view = build(Provider::Codex, None, Some(&FetchError::Unsubscribed), false, T, NOW);
+        assert_eq!(view.rows[0].text, "未订阅");
+        assert_eq!(view.rows[0].fill, None);
+        assert!(!view.stale);
+        assert_eq!(view.tip, "IUsage · Codex\n未订阅付费套餐，已停止刷新");
+        let view = build(Provider::Claude, None, Some(&FetchError::Unsubscribed), false, T, NOW);
+        assert_eq!(view.rows[0].text, "未订阅");
+        assert_eq!(view.tip, "IUsage · Claude\n未返回任何额度（可能未订阅），已停止刷新");
     }
 
     #[test]

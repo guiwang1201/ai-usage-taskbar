@@ -104,18 +104,48 @@ pub fn prepare(
 pub fn send_request(provider: Provider, request: &Request, http: Http) -> Result<Usage, FetchError> {
     let response = http(request).map_err(FetchError::Network)?;
     match response.status {
-        200 => parse(provider, &response.body),
+        200 => read_answer(provider, &response.body),
         401 | 403 => Err(FetchError::Unauthorized),
         429 => Err(FetchError::RateLimited(response.retry_after)),
         other => Err(FetchError::Http(other)),
     }
 }
 
-pub fn parse(provider: Provider, body: &str) -> Result<Usage, FetchError> {
+/// A successful usage answer, or `Unsubscribed` when the account has no paid quota to
+/// meter. Codex names its plan. Claude does not, but an answer whose windows are all
+/// empty, with no newer `limits` list either, leaves nothing to show; a body without the
+/// window keys at all is still an unknown shape (`Parse`), not a free account.
+pub fn read_answer(provider: Provider, body: &str) -> Result<Usage, FetchError> {
     let root = json::parse(body).ok_or(FetchError::Parse)?;
+    if provider == Provider::Codex && get(&root, "plan_type").and_then(text).is_some_and(unpaid_plan) {
+        return Err(FetchError::Unsubscribed);
+    }
+    let usage = parse_root(provider, &root)?;
+    let limits = matches!(get(&root, "limits"), Some(JsonValue::Array(items)) if !items.is_empty());
+    if provider == Provider::Claude && usage == Usage::default() && !limits {
+        return Err(FetchError::Unsubscribed);
+    }
+    Ok(usage)
+}
+
+/// ChatGPT plans without a subscription. Free accounts still get a small monthly Codex
+/// window, but nobody on one needs a meter polling it.
+fn unpaid_plan(plan: &str) -> bool {
+    let plan = plan.to_ascii_lowercase();
+    plan.starts_with("free") || plan == "guest"
+}
+
+/// The windows alone, without the plan check of `read_answer`. The macOS core reads
+/// answers through this.
+#[allow(dead_code)]
+pub fn parse(provider: Provider, body: &str) -> Result<Usage, FetchError> {
+    parse_root(provider, &json::parse(body).ok_or(FetchError::Parse)?)
+}
+
+fn parse_root(provider: Provider, root: &JsonValue) -> Result<Usage, FetchError> {
     match provider {
-        Provider::Claude => parse_claude(&root),
-        Provider::Codex => parse_codex(&root),
+        Provider::Claude => parse_claude(root),
+        Provider::Codex => parse_codex(root),
     }
 }
 
@@ -188,8 +218,7 @@ pub fn build_request(provider: Provider, env: &Env, now: i64) -> Result<Request,
             })
         }
         Provider::Codex => {
-            let file = config_dir("CODEX_HOME", home, ".codex").join("auth.json");
-            let root = read_json(&file)?;
+            let root = read_json(&codex_auth(home))?;
             let tokens = get(&root, "tokens").ok_or(FetchError::NoCredentials)?;
             let token = get(tokens, "access_token").and_then(text).ok_or(FetchError::NoCredentials)?;
             let mut headers = vec![
@@ -212,6 +241,22 @@ pub fn build_request(provider: Provider, env: &Env, now: i64) -> Result<Request,
 
 fn claude_credentials(env: &Env) -> PathBuf {
     env.claude_dir.join(".credentials.json")
+}
+
+fn codex_auth(home: &Path) -> PathBuf {
+    config_dir("CODEX_HOME", home, ".codex").join("auth.json")
+}
+
+/// Unix seconds at which the provider's own software last wrote its sign-in: Claude Code
+/// its `.credentials.json`, Codex its `auth.json`. They do so on a new login and when they
+/// renew tokens, which is when a new subscription would reach them.
+pub fn signed_in_at(provider: Provider, env: &Env) -> Option<i64> {
+    let file = match provider {
+        Provider::Claude => claude_credentials(env),
+        Provider::Codex => codex_auth(&env.home),
+    };
+    let modified = std::fs::metadata(file).ok()?.modified().ok()?;
+    modified.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
 }
 
 /// What the token endpoint answered to a successful renewal.
@@ -695,6 +740,67 @@ mod tests {
         assert_eq!(send_request(Provider::Codex, &request, denied), Err(FetchError::Unauthorized));
         let broken: Http = |_| Ok(Response { status: 200, body: "{}".into(), retry_after: None });
         assert_eq!(send_request(Provider::Claude, &request, broken), Err(FetchError::Parse));
+    }
+
+    #[test]
+    fn a_free_codex_account_is_told_apart_from_a_paid_one() {
+        let request =
+            Request { host: "unused.invalid", path: "/".into(), user_agent: String::new(), headers: Vec::new(), body: None };
+        // Shaped like a free account's answer: one month-long window, no five-hour one.
+        let free: Http = |_| Ok(Response { status: 200, retry_after: None, body: r#"{"plan_type":"free","rate_limit":{
+            "primary_window":{"used_percent":0,"limit_window_seconds":2592000,"reset_at":1793500000},"secondary_window":null}}"#.into() });
+        assert_eq!(send_request(Provider::Codex, &request, free), Err(FetchError::Unsubscribed));
+        for plan in ["guest", "free_workspace", "FREE"] {
+            assert!(unpaid_plan(plan), "{plan}");
+        }
+        for plan in ["plus", "pro", "team", "business", "enterprise", "edu", "go", ""] {
+            assert!(!unpaid_plan(plan), "{plan}");
+        }
+        let paid: Http = |_| Ok(Response { status: 200, body: CODEX.into(), retry_after: None });
+        assert!(send_request(Provider::Codex, &request, paid).is_ok());
+        // Without the field nothing changes, and the bare parser (shared with macOS) still reads the windows.
+        let unknown: Http = |_| Ok(Response { status: 200, body: CODEX.replace(r#""plan_type":"plus","#, ""), retry_after: None });
+        assert!(send_request(Provider::Codex, &request, unknown).is_ok());
+        assert!(parse(Provider::Codex, &CODEX.replace("plus", "free")).is_ok());
+    }
+
+    #[test]
+    fn a_claude_answer_without_any_window_has_nothing_to_meter() {
+        for body in [r#"{"five_hour":null,"seven_day":null,"seven_day_opus":null,"extra_usage":{"is_enabled":false}}"#,
+            r#"{"five_hour":null,"limits":[]}"#, r#"{"seven_day":null,"limits":null}"#] {
+            assert_eq!(read_answer(Provider::Claude, body), Err(FetchError::Unsubscribed), "{body}");
+        }
+        // One window is enough to keep metering, quota moved to a `limits` list is a format
+        // change rather than a free account, and a body without window keys is unknown.
+        assert!(read_answer(Provider::Claude, CLAUDE).is_ok());
+        assert!(read_answer(Provider::Claude, r#"{"five_hour":null,"seven_day":{"utilization":0,"resets_at":null}}"#).is_ok());
+        assert_eq!(read_answer(Provider::Claude, r#"{"five_hour":null,"seven_day":null,"limits":[{"kind":"session","percent":5}]}"#),
+            Ok(Usage::default()));
+        for body in ["{}", r#"{"limits":[]}"#, "<html>blocked</html>"] {
+            assert_eq!(read_answer(Provider::Claude, body), Err(FetchError::Parse), "{body}");
+        }
+        // The bare parser shared with macOS is unchanged.
+        assert_eq!(parse(Provider::Claude, r#"{"five_hour":null,"seven_day":null}"#), Ok(Usage::default()));
+        // Codex is judged by its plan alone.
+        let empty = r#"{"plan_type":"plus","rate_limit":{"primary_window":null,"secondary_window":null}}"#;
+        assert_eq!(read_answer(Provider::Codex, empty), parse(Provider::Codex, empty));
+    }
+
+    #[test]
+    fn sign_in_time_comes_from_each_providers_own_file() {
+        let dir = workdir("sign-in-files");
+        let env = env_in(&dir);
+        assert_eq!(signed_in_at(Provider::Claude, &env), None);
+        assert_eq!(signed_in_at(Provider::Codex, &env), None);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let recent = |at: Option<i64>| at.is_some_and(|at| (now - 5..=now + 5).contains(&at));
+        store(&dir, "{}");
+        assert!(recent(signed_in_at(Provider::Claude, &env)));
+        assert_eq!(signed_in_at(Provider::Codex, &env), None);
+        std::fs::create_dir_all(dir.join(".codex")).unwrap();
+        std::fs::write(dir.join(".codex").join("auth.json"), "{}").unwrap();
+        assert!(recent(signed_in_at(Provider::Codex, &env)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // --- Renewing an expired Claude token. A fake network stands in for the servers: no
