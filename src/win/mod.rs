@@ -57,7 +57,6 @@ const CMD_CLAUDE: u32 = 1;
 const CMD_CODEX: u32 = 2;
 const CMD_USED: u32 = 3;
 const CMD_REMAINING: u32 = 4;
-const CMD_REFRESH: u32 = 5;
 const CMD_AUTOSTART: u32 = 6;
 const CMD_NOTIFY: u32 = 7;
 const CMD_EXIT: u32 = 9;
@@ -559,8 +558,8 @@ unsafe fn utc_offset_secs() -> i64 {
 /// Shows the context menu at the cursor and applies the choice. The menu runs its own
 /// message loop, so the app state must not be borrowed while it is open.
 unsafe fn menu(owner: HWND) {
-    let Some((provider, show_remaining, notify, can_refresh, web, expired)) = with_app(|app| {
-        (app.settings.provider, app.settings.show_remaining, app.settings.notify, app.can_refresh(), web_login::is_web(&app.settings), app.web_expired)
+    let Some((provider, show_remaining, notify, web, expired)) = with_app(|app| {
+        (app.settings.provider, app.settings.show_remaining, app.settings.notify, web_login::is_web(&app.settings), app.web_expired)
     }) else {
         return;
     };
@@ -576,9 +575,6 @@ unsafe fn menu(owner: HWND) {
     item(CMD_USED, "显示已用");
     item(CMD_REMAINING, "显示剩余");
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    // Greyed out right after a refresh and while the service has told us to wait.
-    let refresh = if can_refresh { MF_ENABLED } else { MF_GRAYED };
-    AppendMenuW(menu, MF_STRING | refresh, CMD_REFRESH as usize, wide("立即刷新").as_ptr());
     AppendMenuW(menu, MF_STRING | checked(notify), CMD_NOTIFY as usize, wide("低额度提醒").as_ptr());
     AppendMenuW(menu, MF_STRING | checked(autostart::is_enabled()), CMD_AUTOSTART as usize, wide("开机自启").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -707,13 +703,6 @@ impl App {
         self.schedule[i].next_poll = 0;
         self.fetch_if_due();
         self.refresh();
-    }
-
-    /// Whether "refresh now" may send a request for the displayed provider.
-    fn can_refresh(&self) -> bool {
-        let i = self.settings.provider.index();
-        let now = unix_now();
-        self.fetching.is_none() && !(i == 0 && self.web_expired && web_login::is_web(&self.settings)) && self.schedule[i].can_request(now)
     }
 
     fn stored(&self) -> Stored {
@@ -1221,14 +1210,6 @@ impl App {
                 self.settings.show_remaining = command == CMD_REMAINING;
                 self.save_settings();
                 self.refresh();
-            }
-            CMD_REFRESH => {
-                // The menu greys this out when it is not allowed; checked again here
-                // because things may have changed while the menu was open.
-                if self.can_refresh() {
-                    let provider = self.settings.provider;
-                    self.start_fetch(provider);
-                }
             }
             CMD_NOTIFY => {
                 self.settings.notify = !self.settings.notify;

@@ -232,11 +232,6 @@ final class Prototype: NSObject, NSApplicationDelegate {
         let login = NSMenuItem(title: "配置 Claude SessionKey…", action: #selector(configureClaude), keyEquivalent: "")
         login.target = self; login.isEnabled = live && !loadingCredentials && activeTransports.isEmpty
         menu.addItem(login)
-        let refresh = NSMenuItem(title: "立即刷新", action: #selector(settingSelected(_:)), keyEquivalent: "")
-        refresh.target = self; refresh.tag = 4
-        var gate = runtime.state.gates[runtime.state.selectedProvider].native
-        refresh.isEnabled = (!cachedOnly || live) && !loadingCredentials && !(runtime.state.selectedProvider == 0 && runtime.state.claudeSessionExpired == true) && iusage_can_request(&gate, Int64(Date().timeIntervalSince1970))
-        menu.addItem(refresh)
         let notifications = NSMenuItem(title: "低额度提醒", action: #selector(settingSelected(_:)), keyEquivalent: "")
         notifications.target = self; notifications.tag = 5
         notifications.state = runtime.state.notifications == true ? .on : .off
@@ -268,7 +263,6 @@ final class Prototype: NSObject, NSApplicationDelegate {
             return
         }
         if sender.tag < 2 { chooseProvider(sender.tag); return }
-        if sender.tag == 4 { timer?.invalidate(); if live { fetchLive(provider: runtime.state.selectedProvider) } else { mockTick() }; return }
         do { try runtime.setRemaining(sender.tag == 3) }
         catch { return }
         updateBars(); updateDetails()
