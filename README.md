@@ -1,8 +1,8 @@
 # IUsage
 
-> 非官方工具，接口可能变化。当前提供 Windows 11 x64 v0.1.11 测试版；macOS 暂需自行构建。
+> 非官方工具，接口可能变化。当前提供 Windows 11 x64 v0.1.14 测试版；macOS 暂需自行构建。
 >
-> **[下载 v0.1.11](https://github.com/guiwang1201/ai-usage-taskbar/releases/tag/v0.1.11)**（私有仓库，仅有访问权限的账号可下载） · [快速开始](docs/QUICKSTART.md) · [隐私说明](PRIVACY.md) · [更新记录](CHANGELOG.md) · [安全反馈](SECURITY.md)
+> **[下载 v0.1.14](https://github.com/guiwang1201/ai-usage-taskbar/releases/tag/v0.1.14)**（Windows x64 ZIP，附 SHA-256 校验和） · [快速开始](docs/QUICKSTART.md) · [隐私说明](PRIVACY.md) · [更新记录](CHANGELOG.md) · [安全反馈](SECURITY.md)
 >
 > 首次使用：运行 exe → 右键“Claude 登录设置…”选择网页登录或 Claude Code；Codex 使用本机已有登录。不要向任何人提供 sessionKey 或凭据文件。
 
