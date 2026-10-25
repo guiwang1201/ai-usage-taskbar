@@ -582,6 +582,9 @@ unsafe fn menu(owner: HWND) {
     AppendMenuW(menu, MF_STRING | checked(notify), CMD_NOTIFY as usize, wide("低额度提醒").as_ptr());
     AppendMenuW(menu, MF_STRING | checked(autostart::is_enabled()), CMD_AUTOSTART as usize, wide("开机自启").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    // Informational only: greyed, so it cannot be chosen.
+    let version = concat!("IUsage 版本 ", env!("CARGO_PKG_VERSION"));
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wide(version).as_ptr());
     item(CMD_EXIT, "退出");
     let current = if provider == Provider::Claude { CMD_CLAUDE } else { CMD_CODEX };
     CheckMenuRadioItem(menu, CMD_CLAUDE, CMD_CODEX, current, MF_BYCOMMAND);

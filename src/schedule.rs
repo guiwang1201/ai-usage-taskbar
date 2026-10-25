@@ -5,7 +5,7 @@ use crate::model::FetchError;
 
 /// Shortest time between two requests that reached the same service, whatever asked
 /// for the second one: the schedule, a provider switch, the panel or "refresh now".
-pub const MIN_GAP_SECS: i64 = 75;
+pub const MIN_GAP_SECS: i64 = 65;
 /// How often the reading is refreshed while nobody is at the machine.
 pub const IDLE_POLL_SECS: i64 = 900;
 /// Bounds ordinary poll scheduling after a clock change, never a server cooldown.
@@ -95,16 +95,16 @@ mod tests {
     const NOW: i64 = 1_000_000;
 
     #[test]
-    fn seventy_five_second_poll_preserves_idle_and_server_waits() {
+    fn sixty_five_second_poll_preserves_idle_and_server_waits() {
         let mut state = State::default();
-        state.succeeded(NOW, 75);
-        assert!(!state.due(Some(NOW), false, NOW + 74));
-        assert!(state.due(Some(NOW), false, NOW + 75));
-        assert!(!state.due(Some(NOW), true, NOW + 75));
+        state.succeeded(NOW, 65);
+        assert!(!state.due(Some(NOW), false, NOW + 64));
+        assert!(state.due(Some(NOW), false, NOW + 65));
+        assert!(!state.due(Some(NOW), true, NOW + 65));
         assert!(state.due(Some(NOW), true, NOW + IDLE_POLL_SECS));
-        state.failed(&FetchError::RateLimited(Some(1800)), NOW + 75);
-        assert!(!state.due(Some(NOW), false, NOW + 1874));
-        assert!(state.due(Some(NOW), false, NOW + 1875));
+        state.failed(&FetchError::RateLimited(Some(1800)), NOW + 65);
+        assert!(!state.due(Some(NOW), false, NOW + 1864));
+        assert!(state.due(Some(NOW), false, NOW + 1865));
     }
 
     #[test]
@@ -127,10 +127,10 @@ mod tests {
     fn timeouts_and_in_flight_requests_cannot_bypass_the_gap() {
         let mut state = State::default();
         state.started(NOW);
-        assert!(!state.can_request(NOW + 74));
+        assert!(!state.can_request(NOW + 64));
         state.failed(&FetchError::Network("receive timeout".into()), NOW + 10);
-        assert!(!state.can_request(NOW + 84));
-        assert!(state.can_request(NOW + 85));
+        assert!(!state.can_request(NOW + 74));
+        assert!(state.can_request(NOW + 75));
         // Waking or forcing the periodic schedule cannot remove the error wait.
         state.next_poll = 0;
         assert!(!state.due(None, false, NOW + 20));
