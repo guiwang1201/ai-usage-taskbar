@@ -1,11 +1,24 @@
-param([Parameter(Mandatory=$true)][string]$OutputRoot)
+param(
+    [Parameter(Mandatory=$true)][string]$OutputRoot,
+    [string]$BuildRoot
+)
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $out = [IO.Path]::GetFullPath($OutputRoot)
 if ($out.StartsWith($repo + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or $out -eq $repo -or $out -match '(?i)[\\/]OneDrive(?:[^\\/]*)[\\/]') { throw 'Use an output directory outside the repository and OneDrive.' }
 $version = [regex]::Match([IO.File]::ReadAllText((Join-Path $repo 'Cargo.toml')), '(?m)^version = "([^"]+)"').Groups[1].Value
 $target = 'x86_64-pc-windows-gnu'
-$build = Join-Path $out 'build'
+if (-not $BuildRoot) {
+    Push-Location $repo
+    try {
+        $metadata = & cargo metadata --offline --locked --no-deps --format-version 1
+        if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the Cargo build directory.' }
+        $BuildRoot = ($metadata | ConvertFrom-Json).target_directory
+    } finally { Pop-Location }
+}
+$build = [IO.Path]::GetFullPath($BuildRoot)
+if ($build.StartsWith($repo + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or $build -eq $repo -or $build -match '(?i)[\\/]OneDrive(?:[^\\/]*)[\\/]') { throw 'Use a build directory outside the repository and OneDrive.' }
+if ($build -eq $out -or $build.StartsWith($out + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or $out.StartsWith($build + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Build and package directories must be separate.' }
 $package = Join-Path $out "IUsage-v$version-windows-x64"
 if (Test-Path -LiteralPath $package) { throw 'Choose a fresh output directory; an existing package will not be overwritten.' }
 $oldFlags = $env:RUSTFLAGS

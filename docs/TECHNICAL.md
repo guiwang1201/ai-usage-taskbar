@@ -139,6 +139,7 @@ cargo test
 - 构建结果是 `target/release/iusage.exe`。
 - 应用图标在 `assets/iusage.ico`，包含 16–256 像素的七种尺寸，构建时与原有 DPI 清单一起嵌入；只增加约 19 KiB。`assets/iusage.svg` 是矢量设计，`assets/generate-icon.ps1` 可离线重新生成 ICO，不需要安装资源编译器。托盘直接加载这份嵌入图标，启动时读取一次，之后不再重绘。
 - 如果源码放在会被同步的文件夹里（OneDrive 等），先在自己的 cargo 配置里把 `target-dir` 指到同步范围之外，否则编译产物会被全部上传。Windows 上是 `%USERPROFILE%\.cargo\config.toml`，macOS 上是 `~/.cargo/config.toml`。项目里的 `.cargo/config.toml` 只有这段说明，没有设置。
+- Windows 打包脚本 `scripts/package-windows.ps1 -OutputRoot <发布包目录> [-BuildRoot <编译缓存目录>]` 默认复用 Cargo 配置的缓存目录，也可通过 `-BuildRoot` 指定。编译缓存与发布包目录必须分开，且均应放在 OneDrive 和安装目录之外；安装目录只存放正式程序及回退备份。
 - 依赖库的源码路径会被编译进 exe，其中带着你的系统用户名。要发布 exe 的话，在同一个 cargo 配置里加 `rustflags = ["--remap-path-prefix=<你的用户目录>\\.cargo=cargo"]` 去掉它。
 - 更新已安装的版本：先退出正在运行的程序，再用新的 exe 覆盖旧的，然后重新启动。
 - `iusage.exe --check > out.txt` 用于排查：正式程序运行时不另发请求；否则优先使用新鲜缓存，并跳过冷却中的服务。确需刷新时才请求，并保存结果和退避状态。开发验证优先使用离线测试，不要连续运行诊断命令或阶段 0 的探测脚本。
