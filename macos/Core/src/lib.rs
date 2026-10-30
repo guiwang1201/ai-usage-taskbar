@@ -267,9 +267,9 @@ mod tests {
         unsafe {
             assert_eq!(iusage_min_gap_secs(), schedule::MIN_GAP_SECS);
             assert!(iusage_start(&mut gate, 1000));
-            assert!(!iusage_start(&mut gate, 1064));
+            assert!(!iusage_start(&mut gate, 1054));
             assert_eq!(gate.last_attempt, 1000);
-            assert!(iusage_can_request(&gate, 1065));
+            assert!(iusage_can_request(&gate, 1055));
         }
     }
 
