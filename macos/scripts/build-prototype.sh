@@ -1,14 +1,16 @@
 #!/bin/sh
 set -eu
 MAC_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+VERSION=$(awk '/^\[package\]$/ { in_package = 1; next } /^\[/ { in_package = 0 } in_package && /^version = "[0-9][0-9.]*"$/ { gsub(/"/, "", $3); print $3; exit }' "$MAC_ROOT/../Cargo.toml")
+test -n "$VERSION"
 BUILD_ROOT=${IUSAGE_MAC_BUILD_DIR:-/private/tmp/iusage-mac-build}
 export CARGO_HOME="${CARGO_HOME:-$BUILD_ROOT/cargo-home}"
 mkdir -p "$BUILD_ROOT/module-cache"
 swiftc -warnings-as-errors -module-cache-path "$BUILD_ROOT/module-cache" \
   "$MAC_ROOT/Credentials/Credentials.swift" "$MAC_ROOT/Credentials/CodexStorage.swift" "$MAC_ROOT/Credentials/LocalSources.swift" "$MAC_ROOT/Credentials/LocalIssue.swift" "$MAC_ROOT/Tests/main.swift" -o "$BUILD_ROOT/credential-tests"
 "$BUILD_ROOT/credential-tests"
-cargo test --offline --manifest-path "$MAC_ROOT/Core/Cargo.toml" --target-dir "$BUILD_ROOT/rust"
-cargo build --release --offline --manifest-path "$MAC_ROOT/Core/Cargo.toml" --target-dir "$BUILD_ROOT/rust"
+cargo test --offline --locked --manifest-path "$MAC_ROOT/Core/Cargo.toml" --target-dir "$BUILD_ROOT/rust"
+cargo build --release --offline --locked --manifest-path "$MAC_ROOT/Core/Cargo.toml" --target-dir "$BUILD_ROOT/rust"
 CORE_LIB="$BUILD_ROOT/rust/release/libiusage_mac_core.a"
 CORE_HEADER="$MAC_ROOT/Core/include/IUsageCore.h"
 swiftc -warnings-as-errors -module-cache-path "$BUILD_ROOT/module-cache" \
@@ -54,11 +56,12 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.iusage.offline-prototype</string>
 <key>CFBundleName</key><string>IUsage Prototype</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleVersion</key><string>1</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP_DIR/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$APP_DIR/Contents/Info.plist"
 strip -x "$APP_DIR/Contents/MacOS/IUsagePrototype"
 codesign --force --sign - "$APP_DIR"
 printf '%s\n' "$APP_DIR"

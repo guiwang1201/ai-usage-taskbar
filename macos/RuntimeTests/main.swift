@@ -7,17 +7,17 @@ let body = #"{"five_hour":{"utilization":32},"seven_day":{"utilization":64}}"#
 var sends = 0
 precondition(try! runtime.simulate(provider: 0, now: 1000, status: 200, body: body, onSend: { sends += 1 }))
 precondition(runtime.state.readings[0]?.five == 32)
-precondition(runtime.nextEvent(provider: 0, now: 1001, idle: false) == 1180)
+precondition(runtime.nextEvent(provider: 0, now: 1001, idle: false) == 1065)
 precondition(runtime.nextEvent(provider: 0, now: 1001, idle: true) == 1900)
 let restarted = OfflineRuntime(state: try store.load(), save: store.save)
-precondition(try! !restarted.simulate(provider: 0, now: 1089, status: 200, body: body, onSend: { sends += 1 }))
+precondition(try! !restarted.simulate(provider: 0, now: 1064, status: 200, body: body, onSend: { sends += 1 }))
 precondition(sends == 1)
-precondition(try! restarted.simulate(provider: 0, now: 1180, status: 429, retryAfter: 600, body: ""))
+precondition(try! restarted.simulate(provider: 0, now: 1065, status: 429, retryAfter: 600, body: ""))
 let cooled = OfflineRuntime(state: try store.load(), save: store.save)
-precondition(cooled.nextEvent(provider: 0, now: 1300, idle: false) == 1780)
+precondition(cooled.nextEvent(provider: 0, now: 1300, idle: false) == 1665)
 precondition(cooled.state.readings[0]?.five == 32)
-precondition(try! !cooled.simulate(provider: 0, now: 1779, status: 200, body: body))
-precondition(try! cooled.simulate(provider: 0, now: 1780, status: 200, body: "{}"))
+precondition(try! !cooled.simulate(provider: 0, now: 1664, status: 200, body: body))
+precondition(try! cooled.simulate(provider: 0, now: 1665, status: 200, body: "{}"))
 precondition(cooled.state.readings[0]?.fetchedAt == 1000)
 try cooled.select(1)
 precondition(try! store.load().selectedProvider == 1)
@@ -27,7 +27,7 @@ catch {}
 let partial = OfflineRuntime(state: OfflineState(), save: { _ in })
 precondition(try! partial.simulate(provider: 0, now: 1000, status: 200, body: #"{"five_hour":null,"seven_day":{"utilization":0}}"#))
 precondition(partial.state.readings[0]?.five == nil && partial.state.readings[0]?.seven == 0)
-precondition(try! partial.simulate(provider: 0, now: 1180, status: 0, body: ""))
+precondition(try! partial.simulate(provider: 0, now: 1065, status: 0, body: ""))
 precondition(partial.errors[0] == "离线" && partial.state.readings[0]?.seven == 0)
 var corrupt = OfflineState()
 corrupt.gates[0].blockedUntil = Int64.max
@@ -72,11 +72,20 @@ precondition(DisplayFormat.longCountdown(6 * 86400 + 13 * 3600) == "6 天 13 小
 print("PASS: display mode persists and countdown matches Windows units")
 
 var marks = [AlertMark(), AlertMark()]
-let high = SavedReading(five: 80, seven: 10, fetchedAt: 1000, fiveReset: 2000, sevenReset: 3000)
-precondition(AlertPolicy.evaluate(reading: high, marks: &marks, now: 1000).count == 1)
-precondition(AlertPolicy.evaluate(reading: high, marks: &marks, now: 1001).isEmpty)
-let newWindow = SavedReading(five: 95, seven: 10, fetchedAt: 1000, fiveReset: 4000, sevenReset: 5000)
-precondition(AlertPolicy.evaluate(reading: newWindow, marks: &marks, now: 2001).count == 1)
+func alerts(_ five: Double, _ fiveReset: Int64, _ seven: Double = 10, now: Int64 = 1000) -> [String] {
+    AlertPolicy.evaluate(reading: SavedReading(five: five, seven: seven, fetchedAt: now, fiveReset: fiveReset, sevenReset: 90_000), marks: &marks, now: now)
+}
+precondition(alerts(79, 8200).isEmpty)
+// 20% left, worded and timed as on Windows, and only once.
+precondition(alerts(80, 8200) == ["5 小时额度剩余 20%，2h 后重置"])
+precondition(alerts(81, 8200).isEmpty && alerts(89, 8200).isEmpty)
+precondition(alerts(90, 8200) == ["5 小时额度剩余 10%，2h 后重置"])
+precondition(alerts(95, 8200) == ["5 小时额度剩余 5%，2h 后重置"])
+precondition(alerts(99, 8200).isEmpty && marks[0].level == 3)
+// A reset time that only drifts later is not a new window.
+precondition(alerts(97, 8203, now: 1090).isEmpty)
+// Once the old reset has passed, the new window can alert again.
+precondition(alerts(82, 30_000, now: 8300) == ["5 小时额度剩余 18%，6h 后重置"])
 print("PASS: alerts deduplicate and rearm on a new window")
 
 let issues = OfflineRuntime(state: OfflineState(), save: { _ in })

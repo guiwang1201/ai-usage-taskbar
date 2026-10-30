@@ -106,6 +106,52 @@ pub unsafe extern "C" fn iusage_complete(gate: *mut MacGate, now: i64, status: u
     true
 }
 
+/// The shortest time between two requests to one service, and the default refresh
+/// period: the shared Windows value, so the two platforms cannot drift apart.
+#[no_mangle]
+pub extern "C" fn iusage_min_gap_secs() -> i64 {
+    schedule::MIN_GAP_SECS
+}
+
+/// Reminder decision for one fresh reading, using the shared `alert` rules.
+///
+/// `announced` holds the reminder points already announced for the 5-hour and 7-day
+/// window (0..=3) and is updated in place; `previous_reset` is each window's reset time
+/// when it was last checked (0 = none). `usage` is the new reading, laid out as
+/// `iusage_parse` leaves it. The lines to show are written to `out`, separated by `\n`.
+///
+/// Returns 0 on success (possibly with no lines), 1 on invalid arguments or a buffer
+/// that is too small; `announced` is left untouched in that case.
+/// # Safety
+/// Non-null pointers must reference readable/writable memory of the stated sizes
+/// (`announced`: 2 bytes, `previous_reset`: 2 values).
+#[no_mangle]
+pub unsafe extern "C" fn iusage_alert_check(
+    usage: *const MacUsage, announced: *mut u8, previous_reset: *const i64, now: i64,
+    out: *mut u8, capacity: usize, out_len: *mut usize,
+) -> i32 {
+    if usage.is_null() || announced.is_null() || previous_reset.is_null() || out_len.is_null() { return 1; }
+    *out_len = 0;
+    let u = &*usage;
+    let window = |pct: f64, reset: i64, has_window: bool, has_reset: bool| {
+        has_window.then_some(model::Window { used_pct: pct, resets_at: has_reset.then_some(reset) })
+    };
+    let current = model::Usage {
+        five_hour: window(u.five_hour, u.five_reset, u.present & 1 != 0, u.present & 4 != 0),
+        seven_day: window(u.seven_day, u.seven_reset, u.present & 2 != 0, u.present & 8 != 0),
+    };
+    let previous_reset = std::slice::from_raw_parts(previous_reset, 2);
+    let before = |reset: i64| Some(model::Window { used_pct: 0., resets_at: (reset != 0).then_some(reset) });
+    let previous = model::Usage { five_hour: before(previous_reset[0]), seven_day: before(previous_reset[1]) };
+    let mut marks: alert::Announced = [(*announced).min(3), (*announced.add(1)).min(3)];
+    alert::rearm(&mut marks, &previous, &current, now);
+    let lines = alert::check(&mut marks, &current, now).map(|a| a.lines.join("\n")).unwrap_or_default();
+    if !copy_out(&lines, out, capacity, out_len) { return 1; }
+    *announced = marks[0];
+    *announced.add(1) = marks[1];
+    0
+}
+
 unsafe fn utf8<'a>(bytes: *const u8, len: usize) -> Option<&'a str> {
     if len == 0 { return Some(""); }
     if bytes.is_null() || len > 1_048_576 { return None; }
@@ -219,10 +265,62 @@ mod tests {
     fn ffi_reserves_gap_and_preserves_rejection() {
         let mut gate = MacGate::default();
         unsafe {
+            assert_eq!(iusage_min_gap_secs(), schedule::MIN_GAP_SECS);
             assert!(iusage_start(&mut gate, 1000));
-            assert!(!iusage_start(&mut gate, 1089));
+            assert!(!iusage_start(&mut gate, 1064));
             assert_eq!(gate.last_attempt, 1000);
-            assert!(iusage_can_request(&gate, 1090));
+            assert!(iusage_can_request(&gate, 1065));
+        }
+    }
+
+    fn reading(five: Option<(f64, i64)>, seven: Option<(f64, i64)>) -> MacUsage {
+        let mut u = MacUsage::default();
+        if let Some((pct, reset)) = five { u.five_hour = pct; u.five_reset = reset; u.present |= 1 | 4; }
+        if let Some((pct, reset)) = seven { u.seven_day = pct; u.seven_reset = reset; u.present |= 2 | 8; }
+        u
+    }
+    fn alert_check(u: &MacUsage, announced: &mut [u8; 2], previous: [i64; 2], now: i64) -> (i32, String) {
+        let mut out = vec![0u8; 512];
+        let mut len = 0usize;
+        let code = unsafe { iusage_alert_check(u, announced.as_mut_ptr(), previous.as_ptr(), now, out.as_mut_ptr(), out.len(), &mut len) };
+        (code, String::from_utf8(out[..len].to_vec()).unwrap())
+    }
+
+    #[test]
+    fn ffi_alerts_follow_the_shared_remaining_percentage_rules() {
+        let now = 1_000_000;
+        let (five_reset, seven_reset) = (now + 7200 + 30, now + 3 * 86_400 + 30);
+        let mut announced = [0u8; 2];
+        // Quiet above 20% left.
+        assert_eq!(alert_check(&reading(Some((79., five_reset)), Some((10., seven_reset))), &mut announced, [0, 0], now), (0, String::new()));
+        // 20% left: one line with the same wording as Windows, then silence.
+        let high = reading(Some((80., five_reset)), Some((10., seven_reset)));
+        assert_eq!(alert_check(&high, &mut announced, [five_reset, seven_reset], now), (0, "5 小时额度剩余 20%，2h 后重置".to_string()));
+        assert_eq!(announced, [1, 0]);
+        assert_eq!(alert_check(&high, &mut announced, [five_reset, seven_reset], now).1, "");
+        // 10% and 5% left each fire once.
+        assert!(alert_check(&reading(Some((90., five_reset)), None), &mut announced, [five_reset, 0], now).1.contains("剩余 10%"));
+        assert!(alert_check(&reading(Some((95., five_reset)), None), &mut announced, [five_reset, 0], now).1.contains("剩余 5%"));
+        assert_eq!(announced[0], 3);
+        // A reset time that only drifts later does not re-arm ...
+        assert_eq!(alert_check(&reading(Some((95., five_reset + 3)), None), &mut announced, [five_reset, 0], now + 90).1, "");
+        // ... but a window whose old reset has passed does.
+        let later = five_reset + 60;
+        let fresh = reading(Some((82., later + 18_000)), Some((10., seven_reset)));
+        assert!(alert_check(&fresh, &mut announced, [five_reset, seven_reset], later).1.contains("剩余 18%"));
+    }
+
+    #[test]
+    fn ffi_alert_rejects_bad_arguments_and_keeps_state() {
+        let mut announced = [2u8, 1];
+        let u = reading(Some((99., 5000)), None);
+        let mut tiny = [0u8; 2];
+        let mut len = 0usize;
+        unsafe {
+            let previous = [5000i64, 0];
+            assert_eq!(iusage_alert_check(&u, announced.as_mut_ptr(), previous.as_ptr(), 1000, tiny.as_mut_ptr(), tiny.len(), &mut len), 1);
+            assert_eq!(announced, [2, 1]);
+            assert_eq!(iusage_alert_check(std::ptr::null(), announced.as_mut_ptr(), previous.as_ptr(), 1000, tiny.as_mut_ptr(), tiny.len(), &mut len), 1);
         }
     }
 

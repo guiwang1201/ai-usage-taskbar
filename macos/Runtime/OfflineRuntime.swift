@@ -57,6 +57,10 @@ final class OfflineStore {
     }
 }
 
+// Shortest time between two requests to one service, and the refresh period: the
+// shared Rust value, which is also what Windows uses.
+let requestGap = iusage_min_gap_secs()
+
 // The entire runtime is main-thread/serial-owner only. No live transport exists.
 final class OfflineRuntime {
     private(set) var state: OfflineState
@@ -127,10 +131,10 @@ final class OfflineRuntime {
         return lines
     }
     func nextEvent(provider: Int, now: Int64, idle: Bool) -> Int64 {
-        if inFlight.contains(provider) { return now + 90 }
+        if inFlight.contains(provider) { return now + requestGap }
         let gate = state.gates[provider]
         let idleUntil = idle ? (state.readings[provider]?.fetchedAt ?? 0) + 900 : 0
-        return max(now, gate.nextPoll, gate.blockedUntil, gate.lastAttempt + 90, idleUntil)
+        return max(now, gate.nextPoll, gate.blockedUntil, gate.lastAttempt + requestGap, idleUntil)
     }
     // Mock response only; production networking must use a separate explicit adapter.
     @discardableResult
@@ -164,7 +168,7 @@ final class OfflineRuntime {
         guard inFlight.remove(provider) != nil else { return }
         localIssues[provider] = nil
         var gate = state.gates[provider].native
-        _ = iusage_complete(&gate, now, status, retryAfter, 90)
+        _ = iusage_complete(&gate, now, status, retryAfter, UInt32(requestGap))
         state.gates[provider] = SavedGate(gate)
         errors[provider] = status == 200 ? nil : label
         try save(state)
@@ -180,7 +184,7 @@ final class OfflineRuntime {
         } == 0
         // Malformed 200 must not overwrite the last successful reading.
         let effectiveStatus: UInt16 = status == 200 && !parsed ? 502 : status
-        _ = iusage_complete(&gate, now, effectiveStatus, retryAfter, 180)
+        _ = iusage_complete(&gate, now, effectiveStatus, retryAfter, UInt32(requestGap))
         state.gates[provider] = SavedGate(gate)
         errors[provider] = parsed ? nil : status == 429 ? "限流" : status == 401 || status == 403 ? "凭据被拒绝" : status == 0 ? "离线" : status == 200 ? "数据错误" : "HTTP \(status)"
         if parsed { state.readings[provider] = SavedReading(five: usage.present & 1 != 0 ? usage.five_hour : nil, seven: usage.present & 2 != 0 ? usage.seven_day : nil, fetchedAt: now, fiveReset: usage.present & 4 != 0 ? usage.five_reset : nil, sevenReset: usage.present & 8 != 0 ? usage.seven_reset : nil) }

@@ -5,24 +5,28 @@ struct AlertMark: Codable {
     var reset: Int64?
 }
 enum AlertPolicy {
+    // The rules (20%, 10% and 5% left, once each per window, re-armed by a passed reset)
+    // live in the shared Rust `alert` module, as on Windows. This only marshals the
+    // persisted marks across the C interface.
     static func evaluate(reading: SavedReading, marks: inout [AlertMark], now: Int64) -> [String] {
-        let values = reading.values(now: now)
-        let resets = [reading.fiveReset, reading.sevenReset]
-        var lines: [String] = []
-        for i in 0...1 {
-            // Reset times drift by a second or so between readings; only a passed reset is a new window.
-            if let before = marks[i].reset, before <= now, resets[i] != nil { marks[i].level = 0 }
-            marks[i].reset = resets[i]
-            let used = Int((values[i] ?? 0).rounded())
-            // One reminder each at 20%, 10% and 5% left, as on Windows.
-            func level(_ n: Int) -> Int { [20, 10, 5].filter { 100 - n <= $0 }.count }
-            marks[i].level = min(marks[i].level, level(used + 5))
-            let current = level(used)
-            if current > marks[i].level {
-                marks[i].level = current
-                lines.append("\(i == 0 ? "5 小时" : "7 天")额度剩余 \(100 - used)%")
-            }
+        var usage = MacUsage()
+        if let five = reading.five {
+            usage.five_hour = five; usage.present |= 1
+            if let reset = reading.fiveReset { usage.five_reset = reset; usage.present |= 4 }
         }
-        return lines
+        if let seven = reading.seven {
+            usage.seven_day = seven; usage.present |= 2
+            if let reset = reading.sevenReset { usage.seven_reset = reset; usage.present |= 8 }
+        }
+        var announced = marks.map { UInt8(clamping: $0.level) }
+        let previous = marks.map { $0.reset ?? 0 }
+        guard announced.count == 2 else { return [] }
+        var buffer = [UInt8](repeating: 0, count: 512)
+        var length = 0
+        let code = iusage_alert_check(&usage, &announced, previous, now, &buffer, buffer.count, &length)
+        guard code == 0 else { return [] }
+        let resets = [reading.fiveReset, reading.sevenReset]
+        for i in 0...1 { marks[i] = AlertMark(level: Int(announced[i]), reset: resets[i]) }
+        return String(decoding: buffer[..<length], as: UTF8.self).split(separator: "\n").map(String.init)
     }
 }
